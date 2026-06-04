@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.local/
+data/
+data-test/
+*.log
+*.tsbuildinfo
+.env
+apps/*/node_modules/
+apps/*/dist/

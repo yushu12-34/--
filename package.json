@@ -1,0 +1,15 @@
+{
+  "name": "anime-canvas-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "setup": "powershell -ExecutionPolicy Bypass -File scripts/setup-local.ps1",
+    "dev": "powershell -ExecutionPolicy Bypass -File scripts/start-local.ps1",
+    "dev:api": "npm --prefix apps/api run dev",
+    "dev:web": "npm --prefix apps/web run dev -- --port 5180",
+    "stop": "powershell -ExecutionPolicy Bypass -File scripts/stop-local.ps1",
+    "build": "npm --prefix apps/web run build",
+    "test": "node --experimental-strip-types --experimental-specifier-resolution=node --test tests/*.mjs",
+    "check": "node --check apps/api/src/server.js && node --check apps/api/src/db.js && node --check apps/api/src/services/taskService.js && node --check apps/api/src/services/imageGeneration.js && npm test && npm --prefix apps/web run build"
+  }
+}
