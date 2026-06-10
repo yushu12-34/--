@@ -1,6 +1,8 @@
-import { readJson, writeJson } from "../db.js";
+import { readJsonQueued, updateJson } from "../db.js";
 import { id, now } from "../utils/http.js";
 import { createMockImageResult, generateImageWithModel } from "./imageGeneration.js";
+import { enqueueTask } from "./queueService.js";
+import { storeGeneratedAsset } from "./storageService.js";
 
 const runningTasks = new Set();
 
@@ -23,26 +25,58 @@ export async function createAiTask(body) {
     createdAt: timestamp,
     updatedAt: timestamp,
   };
-  const db = await readJson();
-  db.tasks.unshift(task);
-  await writeJson(db);
-  queueMicrotask(() => runTask(task.id));
+  await updateJson((db) => {
+    db.tasks.unshift(task);
+  });
+  await enqueueTask(task);
   return { task };
 }
 
 export async function getAiTask(taskId) {
-  const db = await readJson();
+  const db = await readJsonQueued();
   return db.tasks.find((task) => task.id === taskId);
+}
+
+export async function cancelAiTask(taskId) {
+  const task = await updateJson((db) => {
+    const item = db.tasks.find((candidate) => candidate.id === taskId);
+    if (!item) return null;
+    if (item.status === "succeeded" || item.status === "failed") return item;
+    item.status = "cancelled";
+    item.progress = 0;
+    item.error = "任务已取消";
+    item.updatedAt = now();
+    return item;
+  });
+  return task;
+}
+
+export async function retryAiTask(taskId) {
+  const timestamp = now();
+  const task = await updateJson((db) => {
+    const item = db.tasks.find((candidate) => candidate.id === taskId);
+    if (!item) return null;
+    if (item.status === "pending" || item.status === "running") return item;
+    delete item.output;
+    delete item.error;
+    item.status = "pending";
+    item.progress = 0;
+    item.updatedAt = timestamp;
+    return item;
+  });
+  if (task?.status === "pending") await enqueueTask(task);
+  return task;
 }
 
 export async function runTask(taskId) {
   if (runningTasks.has(taskId)) return;
   runningTasks.add(taskId);
   try {
-    await patchTask(taskId, { status: "running", progress: 10 });
-    const db = await readJson();
+    const started = await patchTask(taskId, { status: "running", progress: 10 }, { onlyStatus: "pending" });
+    if (!started) return;
+    const db = await readJsonQueued();
     const task = db.tasks.find((item) => item.id === taskId);
-    if (!task) return;
+    if (!task || task.status === "cancelled") return;
 
     if (task.type !== "image.generate") {
       await patchTask(taskId, { status: "failed", progress: 0, error: "当前 MVP 只实现图片生成任务" });
@@ -59,7 +93,9 @@ export async function runTask(taskId) {
     let imageResult;
     try {
       await patchTask(taskId, { progress: 30 });
-      imageResult = await generateImageWithModel(provider, model, task.input);
+      imageResult = await generateImageWithModel(provider, model, task.input, (progress) =>
+        patchTask(taskId, { progress }, { onlyStatus: "running" }),
+      );
     } catch (error) {
       if (model.allowMockFallback !== false) {
         imageResult = {
@@ -74,38 +110,49 @@ export async function runTask(taskId) {
     }
 
     const finishedAt = now();
-    const imageUrl = imageResult.url;
+    const storedAsset = await storeGeneratedAsset({
+      projectId: task.projectId,
+      taskId,
+      mediaType: "image",
+      sourceUrl: imageResult.url,
+    });
+    const imageUrl = storedAsset.url;
     const asset = {
       id: id("asset"),
       projectId: task.projectId,
       type: "image",
       url: imageUrl,
       thumbnailUrl: imageUrl,
-      mimeType: imageUrl.startsWith("data:image/png") ? "image/png" : "image/svg+xml",
-      size: imageUrl.length,
+      mimeType: storedAsset.mimeType,
+      size: storedAsset.size,
       source: "ai-generated",
+      storage: storedAsset.storage,
+      objectName: storedAsset.objectName,
+      bucket: storedAsset.bucket,
       createdBy: "local-user",
       createdAt: finishedAt,
     };
 
-    const latestDb = await readJson();
-    const latestTask = latestDb.tasks.find((item) => item.id === taskId);
-    if (!latestTask) return;
-    latestTask.status = "succeeded";
-    latestTask.progress = 100;
-    latestTask.output = { assetId: asset.id, url: imageUrl, providerTaskId: imageResult.providerTaskId, raw: imageResult.raw };
-    latestTask.updatedAt = finishedAt;
-    latestDb.assets.unshift(asset);
-    await writeJson(latestDb);
+    await updateJson((latestDb) => {
+      const latestTask = latestDb.tasks.find((item) => item.id === taskId);
+      if (!latestTask || latestTask.status === "cancelled") return;
+      latestTask.status = "succeeded";
+      latestTask.progress = 100;
+      latestTask.output = { assetId: asset.id, url: imageUrl, providerTaskId: imageResult.providerTaskId, raw: imageResult.raw };
+      latestTask.updatedAt = finishedAt;
+      latestDb.assets.unshift(asset);
+    });
   } finally {
     runningTasks.delete(taskId);
   }
 }
 
-async function patchTask(taskId, patch) {
-  const db = await readJson();
-  const task = db.tasks.find((item) => item.id === taskId);
-  if (!task) return;
-  Object.assign(task, patch, { updatedAt: now() });
-  await writeJson(db);
+async function patchTask(taskId, patch, options = {}) {
+  return updateJson((db) => {
+    const task = db.tasks.find((item) => item.id === taskId);
+    if (!task) return false;
+    if (options.onlyStatus && task.status !== options.onlyStatus) return false;
+    Object.assign(task, patch, { updatedAt: now() });
+    return true;
+  });
 }

@@ -40,6 +40,7 @@ function Read-LocalPorts {
   $ports = @{
     api = 8787
     web = 5180
+    admin = 5190
   }
 
   $envFile = "$root\.env"
@@ -50,6 +51,7 @@ function Read-LocalPorts {
         $key, $value = $line.Split("=", 2)
         if ($key.Trim() -eq "API_PORT") { $ports.api = [int]$value.Trim() }
         if ($key.Trim() -eq "WEB_PORT") { $ports.web = [int]$value.Trim() }
+        if ($key.Trim() -eq "ADMIN_PORT") { $ports.admin = [int]$value.Trim() }
       }
     }
   }
@@ -59,7 +61,7 @@ function Read-LocalPorts {
 
 if (Test-Path $pidFile) {
   $pids = Get-Content $pidFile -Raw | ConvertFrom-Json
-  foreach ($processId in @($pids.api, $pids.web)) {
+  foreach ($processId in @($pids.api, $pids.web, $pids.admin)) {
     Stop-ProcessTree -ProcessId $processId
   }
   Remove-Item $pidFile -Force
@@ -70,5 +72,6 @@ if (Test-Path $pidFile) {
 $ports = Read-LocalPorts
 Stop-PortOwner -Port $ports.api
 Stop-PortOwner -Port $ports.web
+Stop-PortOwner -Port $ports.admin
 
 Write-Host "Local services stopped."

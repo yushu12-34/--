@@ -22,6 +22,8 @@ export interface WorkflowNode {
     taskId?: string;
     progress?: number;
     error?: string;
+    inputSignature?: string;
+    cacheHit?: boolean;
   };
   createdAt: string;
   updatedAt: string;
@@ -78,6 +80,13 @@ export interface WorkflowGroup {
     width: number;
     height: number;
   };
+  runtime?: {
+    status: "idle" | "running" | "succeeded" | "failed";
+    total?: number;
+    completed?: number;
+    failed?: number;
+    skipped?: number;
+  };
   dragging?: boolean;
   createdAt: string;
 }
@@ -86,6 +95,18 @@ export interface ProjectRecord {
   id: string;
   name: string;
   ownerId: string;
+  createdAt: string;
+  updatedAt: string;
+  canvasCount?: number;
+  assetCount?: number;
+  historyUpdateCount?: number;
+  historySnapshotCount?: number;
+  lastCanvasUpdatedAt?: string;
+}
+
+export interface UserRecord {
+  id: string;
+  name: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -97,6 +118,35 @@ export interface CanvasRecord {
   snapshot: CanvasSnapshot;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface YjsSnapshotRecord {
+  id: string;
+  canvasId: string;
+  clock: number;
+  updateCount: number;
+  updateSize: number;
+  createdAt: string;
+}
+
+export interface YjsSnapshotDetail {
+  record: YjsSnapshotRecord;
+  snapshot: CanvasSnapshot;
+  summary: {
+    nodes: number;
+    edges: number;
+    groups: number;
+  };
+}
+
+export interface ProjectBundle {
+  version: number;
+  exportedAt: string;
+  project: ProjectRecord;
+  canvases: CanvasRecord[];
+  assets: AssetRecord[];
+  workflowUpdates?: Array<Record<string, unknown>>;
+  workflowSnapshots?: Array<Record<string, unknown>>;
 }
 
 export interface AssetRecord {
