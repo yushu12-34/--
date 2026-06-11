@@ -25,6 +25,10 @@ export function listTasks() {
   return request<{ tasks: AITask[] }>("/tasks");
 }
 
+export function getTask(id: string) {
+  return request<{ task: AITask }>(`/tasks/${encodeURIComponent(id)}`);
+}
+
 export function listProviders() {
   return request<{ providers: Array<Record<string, unknown>> }>("/providers");
 }

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { cancelTask, createModel, createProvider, listModels, listProviders, listTasks, retryTask, testProvider, updateModel, updateProvider } from "../api";
+import { cancelTask, createModel, createProvider, getTask, listModels, listProviders, listTasks, retryTask, testProvider, updateModel, updateProvider } from "../api";
+import type { AITask, ErrorCategory } from "../types";
 
 interface ParamSchemaEntry {
   key: string;
@@ -327,6 +328,8 @@ export function AdminPage() {
   const [editingModel, setEditingModel] = useState<Record<string, unknown> | null>(null);
   const [editingProvider, setEditingProvider] = useState<Record<string, unknown> | null>(null);
   const [adminNotice, setAdminNotice] = useState("");
+  const [selectedTask, setSelectedTask] = useState<AITask | null>(null);
+  const [taskDetailLoading, setTaskDetailLoading] = useState(false);
 
   // 供应商表单
   const [providerForm, setProviderForm] = useState({
@@ -516,6 +519,43 @@ export function AdminPage() {
     await retryTask(String(task.id));
     await reloadAdmin();
     setAdminNotice("任务已重新入队");
+  };
+
+  // 任务详情
+  const openTaskDetail = async (task: Record<string, unknown>) => {
+    setTaskDetailLoading(true);
+    setSelectedTask(null);
+    try {
+      const result = await getTask(String(task.id));
+      setSelectedTask(result.task);
+    } catch (error) {
+      setAdminNotice(error instanceof Error ? error.message : "获取任务详情失败");
+    } finally {
+      setTaskDetailLoading(false);
+    }
+  };
+
+  const closeTaskDetail = () => {
+    setSelectedTask(null);
+  };
+
+  const errorCategoryLabels: Record<ErrorCategory, string> = {
+    connection: "连接失败",
+    auth: "鉴权失败",
+    timeout: "超时",
+    non_json: "非 JSON 响应",
+    field_mapping: "字段映射错误",
+    model_error: "模型错误",
+    other: "其他错误",
+  };
+
+  const formatDuration = (ms?: number): string => {
+    if (ms === undefined || ms === null) return "-";
+    if (ms < 1000) return `${ms}ms`;
+    if (ms < 60000) return `${(ms / 1000).toFixed(1)}秒`;
+    const minutes = Math.floor(ms / 60000);
+    const seconds = ((ms % 60000) / 1000).toFixed(0);
+    return `${minutes}分${seconds}秒`;
   };
 
   // 参数编辑辅助
@@ -910,21 +950,34 @@ export function AdminPage() {
             <div className="task-header">
               <span>类型</span>
               <span>状态</span>
-              <span>进度</span>
               <span>模型</span>
+              <span>供应商</span>
+              <span>耗时</span>
               <span>操作</span>
             </div>
             {tasks.slice(0, 50).map((task) => {
               const status = String(task.status);
               const canCancel = status === "pending" || status === "running";
               const canRetry = status === "failed" || status === "cancelled";
+              const errorCategory = task.errorCategory as ErrorCategory | undefined;
               return (
-                <div key={String(task.id)} className="task-row">
+                <div
+                  key={String(task.id)}
+                  className={`task-row ${selectedTask?.id === task.id ? "task-row-selected" : ""}`}
+                  onClick={() => openTaskDetail(task)}
+                  title="点击查看任务详情"
+                >
                   <span>{String(task.type)}</span>
-                  <span className={`status-${task.status}`}>{status}</span>
-                  <span>{String(task.progress || 0)}%</span>
-                  <span>{String(task.modelId || "-")}</span>
-                  <span className="task-actions">
+                  <span className="task-status-cell">
+                    <span className={`status-${task.status}`}>{status}</span>
+                    {errorCategory && (
+                      <span className={`error-tag error-tag-${errorCategory}`}>{errorCategoryLabels[errorCategory]}</span>
+                    )}
+                  </span>
+                  <span>{String(task.modelDisplayName || task.modelId || "-")}</span>
+                  <span>{String(task.providerName || "-")}</span>
+                  <span>{formatDuration(task.durationMs as number | undefined)}</span>
+                  <span className="task-actions" onClick={(event) => event.stopPropagation()}>
                     <button className="weui-btn weui-btn_mini weui-btn_default" disabled={!canCancel} onClick={() => handleCancelTask(task)}>取消</button>
                     <button className="weui-btn weui-btn_mini weui-btn_primary" disabled={!canRetry} onClick={() => handleRetryTask(task)}>重试</button>
                   </span>
@@ -933,6 +986,98 @@ export function AdminPage() {
             })}
             {!tasks.length && <div className="empty-state">暂无任务记录</div>}
           </div>
+
+          {/* 任务详情面板 */}
+          {taskDetailLoading && <div className="task-detail-loading">加载中…</div>}
+          {selectedTask && !taskDetailLoading && (
+            <div className="task-detail-panel">
+              <div className="task-detail-header">
+                <h3>任务详情</h3>
+                <button className="weui-btn weui-btn_mini weui-btn_default" onClick={closeTaskDetail}>关闭</button>
+              </div>
+              <div className="task-detail-body">
+                <div className="detail-row">
+                  <span className="detail-label">任务 ID</span>
+                  <span className="detail-value">{selectedTask.id}</span>
+                </div>
+                <div className="detail-row">
+                  <span className="detail-label">类型</span>
+                  <span className="detail-value">{selectedTask.type}</span>
+                </div>
+                <div className="detail-row">
+                  <span className="detail-label">状态</span>
+                  <span className="detail-value">
+                    <span className={`status-${selectedTask.status}`}>{selectedTask.status}</span>
+                  </span>
+                </div>
+                <div className="detail-row">
+                  <span className="detail-label">模型</span>
+                  <span className="detail-value">{selectedTask.modelDisplayName || selectedTask.modelId || "-"}</span>
+                </div>
+                <div className="detail-row">
+                  <span className="detail-label">供应商</span>
+                  <span className="detail-value">{selectedTask.providerName || "-"}</span>
+                </div>
+                <div className="detail-row">
+                  <span className="detail-label">创建时间</span>
+                  <span className="detail-value">{selectedTask.createdAt || "-"}</span>
+                </div>
+                <div className="detail-row">
+                  <span className="detail-label">耗时</span>
+                  <span className="detail-value">{formatDuration(selectedTask.durationMs)}</span>
+                </div>
+                {selectedTask.inputSummary && (
+                  <div className="detail-row detail-row-block">
+                    <span className="detail-label">输入摘要</span>
+                    <span className="detail-value detail-prompt">{selectedTask.inputSummary}</span>
+                  </div>
+                )}
+                {!!(selectedTask.input?.params) && typeof selectedTask.input.params === "object" && Object.keys(selectedTask.input.params as Record<string, unknown>).length > 0 && (
+                  <div className="detail-row detail-row-block">
+                    <span className="detail-label">输入参数</span>
+                    <span className="detail-value detail-params">
+                      {String(JSON.stringify(selectedTask.input.params, null, 2))}
+                    </span>
+                  </div>
+                )}
+                {selectedTask.status === "failed" && (
+                  <>
+                    <div className="detail-row">
+                      <span className="detail-label">错误分类</span>
+                      <span className="detail-value">
+                        {selectedTask.errorCategory ? (
+                          <span className={`error-tag error-tag-${selectedTask.errorCategory}`}>
+                            {errorCategoryLabels[selectedTask.errorCategory]}
+                          </span>
+                        ) : "-"}
+                      </span>
+                    </div>
+                    <div className="detail-row detail-row-block">
+                      <span className="detail-label">错误信息</span>
+                      <span className="detail-value detail-error">{selectedTask.error || "-"}</span>
+                    </div>
+                  </>
+                )}
+                {selectedTask.output && (
+                  <div className="detail-row detail-row-block">
+                    <span className="detail-label">输出</span>
+                    <span className="detail-value detail-output">
+                      {selectedTask.output.url ? (
+                        <a href={String(selectedTask.output.url)} target="_blank" rel="noopener noreferrer">查看结果图片</a>
+                      ) : (
+                        JSON.stringify(selectedTask.output, null, 2)
+                      )}
+                    </span>
+                  </div>
+                )}
+              </div>
+              {(selectedTask.status === "failed" || selectedTask.status === "cancelled") && (
+                <div className="task-detail-footer">
+                  <button className="weui-btn weui-btn_primary" onClick={() => { handleRetryTask(selectedTask as unknown as Record<string, unknown>); closeTaskDetail(); }}>重试任务</button>
+                </div>
+              )}
+            </div>
+          )}
         </section>
       )}
 

@@ -403,7 +403,15 @@ async function handle(req, res) {
     }
 
     if (req.method === "GET" && internalPathname === "/internal/tasks") {
-      send(res, 200, { tasks: db.tasks });
+      send(res, 200, { tasks: enrichTaskList(db.tasks, db.models, db.providers) });
+      return;
+    }
+
+    const adminTaskDetailMatch = internalPathname.match(/^\/internal\/tasks\/([^/]+)$/);
+    if (adminTaskDetailMatch && req.method === "GET") {
+      const task = db.tasks.find((item) => item.id === adminTaskDetailMatch[1]);
+      if (!task) return notFound(res);
+      send(res, 200, { task: enrichTask(task, db.models, db.providers) });
       return;
     }
 
@@ -557,6 +565,43 @@ async function handle(req, res) {
       message: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+function classifyError(errorMessage) {
+  if (!errorMessage) return "other";
+  const msg = String(errorMessage).toLowerCase();
+  if (msg.includes("连接失败") || msg.includes("connection") || msg.includes("econnrefused") || msg.includes("enotfound")) return "connection";
+  if (msg.includes("鉴权失败") || msg.includes("unauthorized") || msg.includes("401") || msg.includes("403") || msg.includes("auth")) return "auth";
+  if (msg.includes("超时") || msg.includes("timeout") || msg.includes("aborted")) return "timeout";
+  if (msg.includes("非 json") || msg.includes("non-json") || msg.includes("not valid json")) return "non_json";
+  if (msg.includes("字段映射错误") || msg.includes("未能通过") || msg.includes("读取")) return "field_mapping";
+  if (msg.includes("模型任务失败") || msg.includes("模型接口") || msg.includes("模型供应商") || msg.includes("模型已禁用")) return "model_error";
+  return "other";
+}
+
+function enrichTask(task, models, providers) {
+  const model = models.find((item) => item.id === task.modelId);
+  const provider = model ? providers.find((item) => item.id === model.providerId) : undefined;
+  const createdAt = task.createdAt ? new Date(task.createdAt).getTime() : 0;
+  const updatedAt = task.updatedAt ? new Date(task.updatedAt).getTime() : 0;
+  const durationMs = createdAt && updatedAt ? Math.max(0, updatedAt - createdAt) : undefined;
+
+  const inputSummary = task.input?.prompt
+    ? String(task.input.prompt).slice(0, 200) + (String(task.input.prompt).length > 200 ? "…" : "")
+    : undefined;
+
+  return {
+    ...task,
+    modelDisplayName: model?.displayName || task.modelId || "-",
+    providerName: provider?.name || "-",
+    durationMs,
+    errorCategory: task.status === "failed" ? classifyError(task.error) : undefined,
+    inputSummary,
+  };
+}
+
+function enrichTaskList(tasks, models, providers) {
+  return tasks.map((task) => enrichTask(task, models, providers));
 }
 
 await ensureDb();
