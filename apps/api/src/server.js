@@ -5,6 +5,9 @@ import { createAiTask, getAiTask, cancelAiTask, retryAiTask, runTask } from "./s
 import { initializeTaskQueue } from "./services/queueService.js";
 import { attachCollaborationServer, compactCanvasYDoc, getCanvasYjsHistorySnapshot, listCanvasYjsHistory } from "./services/collaborationService.js";
 import { buildProjectBundle, buildProjectList, copyProject, deleteProjectGraph, importProjectBundle, validateProjectBundle } from "./services/projectArchiveService.js";
+import { createRequiredDbBackup } from "./services/backupService.js";
+import { buildAdminOverview, enrichAdminTask, enrichAdminTaskList, selectRetryableAdminTasks } from "./services/adminOverviewService.js";
+import { listSystemEvents, recordSystemEvent } from "./services/systemEventService.js";
 
 const PORT = Number(process.env.API_PORT || 8787);
 
@@ -36,6 +39,13 @@ async function handle(req, res) {
     const db = await readJson();
 
     if (isInternalPath && !isInternalAdminRequest(req)) {
+      await recordRuntimeEvent({
+        level: "warning",
+        category: "security",
+        source: "api",
+        message: "未授权内部接口访问被拒绝",
+        metadata: { method: req.method, path: pathname, remoteAddress: req.socket?.remoteAddress },
+      });
       send(res, 401, { error: "Unauthorized", message: "Internal admin access is required" });
       return;
     }
@@ -173,12 +183,13 @@ async function handle(req, res) {
       const body = await parseBody(req);
       const validation = validateProjectBundle(body.bundle || body);
       if (!validation.ok) return badRequest(res, validation.error);
+      const backup = await createRequiredDbBackup("project-import");
       const imported = await updateJson((latestDb) => importProjectBundle(latestDb, body.bundle || body, {
         name: body.name,
         ownerId: body.ownerId,
       }));
       if (!imported) return badRequest(res, "Invalid project bundle");
-      send(res, 201, imported);
+      send(res, 201, { ...imported, backup });
       return;
     }
 
@@ -279,6 +290,8 @@ async function handle(req, res) {
     const snapshotMatch = pathname.match(/^\/api\/canvases\/([^/]+)\/snapshot$/);
     if (snapshotMatch && req.method === "PUT") {
       const body = await parseBody(req);
+      const shouldBackup = body.backupOperation === "history-restore";
+      const backup = shouldBackup ? await createRequiredDbBackup("history-restore") : undefined;
       const updatedCanvas = await updateJson((latestDb) => {
         const canvas = latestDb.canvases.find((item) => item.id === snapshotMatch[1]);
         if (!canvas) return null;
@@ -287,7 +300,7 @@ async function handle(req, res) {
         return canvas;
       });
       if (!updatedCanvas) return notFound(res);
-      send(res, 200, { canvas: updatedCanvas });
+      send(res, 200, { canvas: updatedCanvas, backup });
       return;
     }
 
@@ -402,8 +415,66 @@ async function handle(req, res) {
       return;
     }
 
+    if (req.method === "GET" && internalPathname === "/internal/overview") {
+      send(res, 200, { overview: buildAdminOverview(db) });
+      return;
+    }
+
     if (req.method === "GET" && internalPathname === "/internal/tasks") {
-      send(res, 200, { tasks: enrichTaskList(db.tasks, db.models, db.providers) });
+      send(res, 200, { tasks: enrichAdminTaskList(db.tasks, db.models, db.providers) });
+      return;
+    }
+
+    if (req.method === "GET" && internalPathname === "/internal/system-events") {
+      send(res, 200, listSystemEvents(db, {
+        level: url.searchParams.get("level"),
+        category: url.searchParams.get("category"),
+        limit: url.searchParams.get("limit"),
+      }));
+      return;
+    }
+
+    if (req.method === "POST" && internalPathname === "/internal/tasks/retry-batch") {
+      const body = await parseBody(req);
+      const enrichedTasks = enrichAdminTaskList(db.tasks, db.models, db.providers);
+      const retryPlan = selectRetryableAdminTasks(enrichedTasks, {
+        taskIds: body.taskIds,
+        errorCategory: body.errorCategory,
+        statuses: body.statuses,
+        limit: body.limit,
+      });
+      const retriedTasks = [];
+      const failed = [];
+      for (const task of retryPlan.selected) {
+        try {
+          const retriedTask = await retryAiTask(task.id);
+          if (retriedTask) retriedTasks.push(retriedTask);
+          else failed.push({ taskId: task.id, reason: "not_found" });
+        } catch (error) {
+          failed.push({ taskId: task.id, reason: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      await recordRuntimeEvent({
+        level: failed.length ? "warning" : "info",
+        category: "task",
+        source: "admin",
+        message: "后台批量重试任务",
+        metadata: {
+          requested: retryPlan.selected.length,
+          retried: retriedTasks.length,
+          failed: failed.length,
+          skipped: retryPlan.skipped.length,
+          errorCategory: body.errorCategory || "",
+        },
+      });
+      const latestDb = await readJson();
+      send(res, 202, {
+        retried: enrichAdminTaskList(retriedTasks, latestDb.models, latestDb.providers),
+        retriedCount: retriedTasks.length,
+        skipped: [...retryPlan.skipped, ...failed],
+        requestedCount: retryPlan.selected.length,
+        limit: retryPlan.limit,
+      });
       return;
     }
 
@@ -411,7 +482,7 @@ async function handle(req, res) {
     if (adminTaskDetailMatch && req.method === "GET") {
       const task = db.tasks.find((item) => item.id === adminTaskDetailMatch[1]);
       if (!task) return notFound(res);
-      send(res, 200, { task: enrichTask(task, db.models, db.providers) });
+      send(res, 200, { task: enrichAdminTask(task, db.models, db.providers) });
       return;
     }
 
@@ -419,6 +490,13 @@ async function handle(req, res) {
     if (adminTaskCancelMatch && req.method === "POST") {
       const task = await cancelAiTask(adminTaskCancelMatch[1]);
       if (!task) return notFound(res);
+      await recordRuntimeEvent({
+        level: "info",
+        category: "task",
+        source: "admin",
+        message: "后台任务已取消",
+        metadata: { taskId: task.id, status: task.status, type: task.type, modelId: task.modelId },
+      });
       send(res, 200, { task });
       return;
     }
@@ -427,6 +505,13 @@ async function handle(req, res) {
     if (adminTaskRetryMatch && req.method === "POST") {
       const task = await retryAiTask(adminTaskRetryMatch[1]);
       if (!task) return notFound(res);
+      await recordRuntimeEvent({
+        level: "info",
+        category: "task",
+        source: "admin",
+        message: "后台任务已重新入队",
+        metadata: { taskId: task.id, status: task.status, type: task.type, modelId: task.modelId },
+      });
       send(res, 202, { task });
       return;
     }
@@ -455,6 +540,13 @@ async function handle(req, res) {
       await updateJson((latestDb) => {
         latestDb.providers.push(provider);
       });
+      await recordRuntimeEvent({
+        level: "info",
+        category: "model",
+        source: "admin",
+        message: "供应商配置已创建",
+        metadata: { providerId: provider.id, name: provider.name, type: provider.type, authType: provider.authType },
+      });
       send(res, 201, { provider: publicProvider(provider) });
       return;
     }
@@ -463,18 +555,43 @@ async function handle(req, res) {
     if (providerTestMatch && req.method === "POST") {
       const provider = db.providers.find((item) => item.id === providerTestMatch[1]);
       if (!provider) return notFound(res);
-      if (!provider.enabled) return badRequest(res, "供应商已禁用");
+      if (!provider.enabled) {
+        await recordRuntimeEvent({
+          level: "warning",
+          category: "model",
+          source: "admin",
+          message: "禁用供应商被测试",
+          metadata: { providerId: provider.id, name: provider.name },
+        });
+        return badRequest(res, "供应商已禁用");
+      }
       const startedAt = Date.now();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), Number(provider.timeoutSeconds || 30) * 1000);
       try {
         const response = await fetch(provider.baseUrl, { method: "GET", signal: controller.signal });
+        if (!response.ok && response.status >= 500) {
+          await recordRuntimeEvent({
+            level: "warning",
+            category: "model",
+            source: "admin",
+            message: "供应商测试返回异常状态",
+            metadata: { providerId: provider.id, name: provider.name, status: response.status, latencyMs: Date.now() - startedAt },
+          });
+        }
         send(res, 200, {
           ok: response.ok || response.status < 500,
           message: `连接完成，HTTP ${response.status}`,
           latencyMs: Date.now() - startedAt,
         });
       } catch (error) {
+        await recordRuntimeEvent({
+          level: "warning",
+          category: "model",
+          source: "admin",
+          message: "供应商测试连接失败",
+          metadata: { providerId: provider.id, name: provider.name, error: error instanceof Error ? error.message : String(error), latencyMs: Date.now() - startedAt },
+        });
         send(res, 200, {
           ok: false,
           message: error instanceof Error ? error.message : String(error),
@@ -503,6 +620,13 @@ async function handle(req, res) {
         return provider;
       });
       if (!updatedProvider) return notFound(res);
+      await recordRuntimeEvent({
+        level: "info",
+        category: "model",
+        source: "admin",
+        message: "供应商配置已更新",
+        metadata: { providerId: updatedProvider.id, name: updatedProvider.name, enabled: updatedProvider.enabled },
+      });
       send(res, 200, { provider: publicProvider(updatedProvider) });
       return;
     }
@@ -537,6 +661,13 @@ async function handle(req, res) {
       await updateJson((latestDb) => {
         latestDb.models.push(model);
       });
+      await recordRuntimeEvent({
+        level: "info",
+        category: "model",
+        source: "admin",
+        message: "模型配置已创建",
+        metadata: { modelId: model.id, displayName: model.displayName, providerId: model.providerId, type: model.type },
+      });
       send(res, 201, { model });
       return;
     }
@@ -554,12 +685,41 @@ async function handle(req, res) {
         return model;
       });
       if (!updatedModel) return notFound(res);
+      await recordRuntimeEvent({
+        level: "info",
+        category: "model",
+        source: "admin",
+        message: "模型配置已更新",
+        metadata: { modelId: updatedModel.id, displayName: updatedModel.displayName, providerId: updatedModel.providerId, enabled: updatedModel.enabled },
+      });
       send(res, 200, { model: updatedModel });
       return;
     }
 
     notFound(res);
   } catch (error) {
+    if (error?.code === "DB_BACKUP_FAILED") {
+      await recordRuntimeEvent({
+        level: "error",
+        category: "backup",
+        source: "api",
+        message: "危险写入前备份失败",
+        metadata: { method: req.method, path: pathname, operation: error.operation, error: error.message },
+      });
+      send(res, 503, {
+        error: "Backup Failed",
+        message: error.message,
+        operation: error.operation,
+      });
+      return;
+    }
+    await recordRuntimeEvent({
+      level: "error",
+      category: "api",
+      source: "api",
+      message: "API 请求处理失败",
+      metadata: { method: req.method, path: pathname, error: error instanceof Error ? error.message : String(error) },
+    });
     send(res, 500, {
       error: "Internal Server Error",
       message: error instanceof Error ? error.message : String(error),
@@ -604,8 +764,23 @@ function enrichTaskList(tasks, models, providers) {
   return tasks.map((task) => enrichTask(task, models, providers));
 }
 
+async function recordRuntimeEvent(event) {
+  try {
+    await recordSystemEvent(event);
+  } catch (error) {
+    console.warn("failed to record system event", error instanceof Error ? error.message : error);
+  }
+}
+
 await ensureDb();
 const queueStatus = await initializeTaskQueue(runTask);
+await recordRuntimeEvent({
+  level: "info",
+  category: "system",
+  source: "api",
+  message: "API 服务已启动",
+  metadata: { port: PORT, queueMode: queueStatus.mode },
+});
 
 const server = createServer(handle);
 attachCollaborationServer(server);

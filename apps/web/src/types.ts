@@ -175,7 +175,10 @@ export interface AITask {
   output?: Record<string, unknown>;
   error?: string;
   progress?: number;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
   createdBy: string;
   createdAt: string;
+  startedAt?: string;
   updatedAt: string;
 }

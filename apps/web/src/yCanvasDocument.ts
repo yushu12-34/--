@@ -308,28 +308,47 @@ export function removeYCanvasNode(
   origin: unknown = Y_CANVAS_LOCAL_ORIGIN,
 ) {
   transactYCanvas(yCanvas, () => {
+    removeYCanvasNodesInTransaction(yCanvas, [nodeId]);
+  }, origin);
+}
+
+export function removeYCanvasNodes(
+  yCanvas: YCanvasDocument,
+  nodeIds: string[],
+  origin: unknown = Y_CANVAS_LOCAL_ORIGIN,
+) {
+  transactYCanvas(yCanvas, () => {
+    removeYCanvasNodesInTransaction(yCanvas, nodeIds);
+  }, origin);
+}
+
+function removeYCanvasNodesInTransaction(yCanvas: YCanvasDocument, nodeIds: string[]) {
+  const nodeIdSet = new Set(nodeIds);
+  if (!nodeIdSet.size) return;
+
+  for (const nodeId of nodeIdSet) {
     yCanvas.nodes.delete(nodeId);
     removeFromYArray(yCanvas.nodeOrder, nodeId);
+  }
 
-    for (const [edgeId, edgeMap] of Array.from(yCanvas.edges.entries())) {
-      const edge = decodeRecord<WorkflowEdge>(edgeMap);
-      if (edge.sourceNodeId === nodeId || edge.targetNodeId === nodeId) {
-        yCanvas.edges.delete(edgeId);
-        removeFromYArray(yCanvas.edgeOrder, edgeId);
-      }
+  for (const [edgeId, edgeMap] of Array.from(yCanvas.edges.entries())) {
+    const edge = decodeRecord<WorkflowEdge>(edgeMap);
+    if (nodeIdSet.has(edge.sourceNodeId) || nodeIdSet.has(edge.targetNodeId)) {
+      yCanvas.edges.delete(edgeId);
+      removeFromYArray(yCanvas.edgeOrder, edgeId);
     }
+  }
 
-    for (const [groupId, groupMap] of Array.from(yCanvas.groups.entries())) {
-      const group = decodeRecord<WorkflowGroup>(groupMap);
-      const nodeIds = group.nodeIds.filter((id) => id !== nodeId);
-      if (nodeIds.length <= 1) {
-        yCanvas.groups.delete(groupId);
-        removeFromYArray(yCanvas.groupOrder, groupId);
-      } else if (nodeIds.length !== group.nodeIds.length) {
-        yCanvas.groups.set(groupId, encodeRecord({ ...group, nodeIds }));
-      }
+  for (const [groupId, groupMap] of Array.from(yCanvas.groups.entries())) {
+    const group = decodeRecord<WorkflowGroup>(groupMap);
+    const nextNodeIds = group.nodeIds.filter((id) => !nodeIdSet.has(id));
+    if (nextNodeIds.length <= 1) {
+      yCanvas.groups.delete(groupId);
+      removeFromYArray(yCanvas.groupOrder, groupId);
+    } else if (nextNodeIds.length !== group.nodeIds.length) {
+      yCanvas.groups.set(groupId, encodeRecord({ ...group, nodeIds: nextNodeIds }));
     }
-  }, origin);
+  }
 }
 
 export function upsertYCanvasEdge(

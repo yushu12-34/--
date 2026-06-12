@@ -369,6 +369,7 @@ export async function ensureDb() {
       canvases: [],
       assets: [],
       tasks: [],
+      systemEvents: [],
       workflowUpdates: [],
       workflowSnapshots: [],
       providers: [defaultProvider(timestamp), defaultZImageProvider(timestamp)],
@@ -404,6 +405,7 @@ export async function ensureDb() {
   if (!db.canvases) { db.canvases = []; changed = true; }
   if (!db.assets) { db.assets = []; changed = true; }
   if (!db.tasks) { db.tasks = []; changed = true; }
+  if (!db.systemEvents) { db.systemEvents = []; changed = true; }
   if (!db.workflowUpdates) { db.workflowUpdates = []; changed = true; }
   if (!db.workflowSnapshots) { db.workflowSnapshots = []; changed = true; }
 

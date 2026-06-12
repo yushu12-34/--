@@ -3,6 +3,7 @@ dist/
 .local/
 data/
 data-test/
+codex-msix-dryrun/
 *.log
 *.tsbuildinfo
 .env

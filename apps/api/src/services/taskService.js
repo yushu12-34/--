@@ -3,29 +3,48 @@ import { id, now } from "../utils/http.js";
 import { createMockImageResult, generateImageWithModel } from "./imageGeneration.js";
 import { enqueueTask } from "./queueService.js";
 import { storeGeneratedAsset } from "./storageService.js";
+import { recordSystemEvent } from "./systemEventService.js";
 
 const runningTasks = new Set();
+const DEFAULT_TASK_TIMEOUT_MS = 120000;
+const DEFAULT_TASK_POLL_INTERVAL_MS = 2000;
+
+export function resolveTaskRuntimeConfig(db, modelId) {
+  const model = db.models?.find((item) => item.id === modelId);
+  const adapter = model?.adapter && typeof model.adapter === "object" ? model.adapter : {};
+  const timeoutMs = Number(adapter.timeoutMs || DEFAULT_TASK_TIMEOUT_MS);
+  const pollIntervalMs = Number(adapter.pollIntervalMs || DEFAULT_TASK_POLL_INTERVAL_MS);
+  return {
+    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TASK_TIMEOUT_MS,
+    pollIntervalMs: Number.isFinite(pollIntervalMs) && pollIntervalMs > 0 ? pollIntervalMs : DEFAULT_TASK_POLL_INTERVAL_MS,
+  };
+}
 
 export async function createAiTask(body) {
   if (!body.projectId || !body.canvasId || !body.nodeId || !body.type) {
     return { error: "projectId, canvasId, nodeId and type are required" };
   }
   const timestamp = now();
-  const task = {
-    id: id("task"),
-    projectId: body.projectId,
-    canvasId: body.canvasId,
-    nodeId: body.nodeId,
-    modelId: body.modelId || "z-image-turbo",
-    type: body.type,
-    status: "pending",
-    input: body.input || {},
-    progress: 0,
-    createdBy: "local-user",
-    createdAt: timestamp,
-    updatedAt: timestamp,
-  };
+  const modelId = body.modelId || "z-image-turbo";
+  let task;
   await updateJson((db) => {
+    const runtimeConfig = resolveTaskRuntimeConfig(db, modelId);
+    task = {
+      id: id("task"),
+      projectId: body.projectId,
+      canvasId: body.canvasId,
+      nodeId: body.nodeId,
+      modelId,
+      type: body.type,
+      status: "pending",
+      input: body.input || {},
+      progress: 0,
+      timeoutMs: runtimeConfig.timeoutMs,
+      pollIntervalMs: runtimeConfig.pollIntervalMs,
+      createdBy: "local-user",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
     db.tasks.unshift(task);
   });
   await enqueueTask(task);
@@ -57,10 +76,14 @@ export async function retryAiTask(taskId) {
     const item = db.tasks.find((candidate) => candidate.id === taskId);
     if (!item) return null;
     if (item.status === "pending" || item.status === "running") return item;
+    const runtimeConfig = resolveTaskRuntimeConfig(db, item.modelId);
     delete item.output;
     delete item.error;
+    delete item.startedAt;
     item.status = "pending";
     item.progress = 0;
+    item.timeoutMs = runtimeConfig.timeoutMs;
+    item.pollIntervalMs = runtimeConfig.pollIntervalMs;
     item.updatedAt = timestamp;
     return item;
   });
@@ -72,7 +95,8 @@ export async function runTask(taskId) {
   if (runningTasks.has(taskId)) return;
   runningTasks.add(taskId);
   try {
-    const started = await patchTask(taskId, { status: "running", progress: 10 }, { onlyStatus: "pending" });
+    const startedAt = now();
+    const started = await patchTask(taskId, { status: "running", progress: 10, startedAt }, { onlyStatus: "pending" });
     if (!started) return;
     const db = await readJsonQueued();
     const task = db.tasks.find((item) => item.id === taskId);
@@ -80,6 +104,7 @@ export async function runTask(taskId) {
 
     if (task.type !== "image.generate") {
       await patchTask(taskId, { status: "failed", progress: 0, error: "当前 MVP 只实现图片生成任务" });
+      await recordTaskFailure(task, "当前 MVP 只实现图片生成任务");
       return;
     }
 
@@ -87,13 +112,23 @@ export async function runTask(taskId) {
     const provider = model ? db.providers.find((item) => item.id === model.providerId) : undefined;
     if (!model || !provider) {
       await patchTask(taskId, { status: "failed", progress: 0, error: "模型或供应商不存在" });
+      await recordTaskFailure(task, "模型或供应商不存在");
       return;
     }
+
+    const modelForTask = {
+      ...model,
+      adapter: {
+        ...(model.adapter || {}),
+        timeoutMs: task.timeoutMs || model.adapter?.timeoutMs,
+        pollIntervalMs: task.pollIntervalMs || model.adapter?.pollIntervalMs,
+      },
+    };
 
     let imageResult;
     try {
       await patchTask(taskId, { progress: 30 });
-      imageResult = await generateImageWithModel(provider, model, task.input, (progress) =>
+      imageResult = await generateImageWithModel(provider, modelForTask, task.input, (progress) =>
         patchTask(taskId, { progress }, { onlyStatus: "running" }),
       );
     } catch (error) {
@@ -104,7 +139,9 @@ export async function runTask(taskId) {
           raw: { fallback: true, reason: error instanceof Error ? error.message : String(error) },
         };
       } else {
-        await patchTask(taskId, { status: "failed", progress: 0, error: error instanceof Error ? error.message : String(error) });
+        const message = error instanceof Error ? error.message : String(error);
+        await patchTask(taskId, { status: "failed", progress: 0, error: message });
+        await recordTaskFailure(task, message, { modelId: model.id, providerId: provider.id });
         return;
       }
     }
@@ -155,4 +192,25 @@ async function patchTask(taskId, patch, options = {}) {
     Object.assign(task, patch, { updatedAt: now() });
     return true;
   });
+}
+
+async function recordTaskFailure(task, error, metadata = {}) {
+  try {
+    await recordSystemEvent({
+      level: "error",
+      category: "task",
+      source: "task-runner",
+      message: "AI 任务执行失败",
+      metadata: {
+        taskId: task.id,
+        projectId: task.projectId,
+        canvasId: task.canvasId,
+        nodeId: task.nodeId,
+        type: task.type,
+        modelId: task.modelId,
+        error,
+        ...metadata,
+      },
+    });
+  } catch {}
 }

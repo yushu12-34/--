@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { cancelTask, createModel, createProvider, getTask, listModels, listProviders, listTasks, retryTask, testProvider, updateModel, updateProvider } from "../api";
-import type { AITask, ErrorCategory } from "../types";
+import { cancelTask, createModel, createProvider, getOverview, getTask, listModels, listProviders, listSystemEvents, listTasks, retryTask, retryTasksBatch, testProvider, updateModel, updateProvider } from "../api";
+import type { AdminOverview, AITask, ErrorCategory, NodeRuntimeStatus, SystemEventCategory, SystemEventLevel, SystemEventRecord, SystemEventSummary } from "../types";
 
 interface ParamSchemaEntry {
   key: string;
@@ -63,6 +63,44 @@ const DEFAULT_ADAPTER_CONFIG: AdapterConfig = {
   errorPath: "error",
   pollIntervalMs: 2000,
   timeoutMs: 120000,
+};
+
+const EMPTY_SYSTEM_EVENT_SUMMARY: SystemEventSummary = {
+  total: 0,
+  byLevel: { info: 0, warning: 0, error: 0 },
+  byCategory: { system: 0, api: 0, security: 0, task: 0, model: 0, backup: 0 },
+  latestErrorAt: null,
+  latestWarningAt: null,
+};
+
+const EMPTY_ADMIN_OVERVIEW: AdminOverview = {
+  generatedAt: "",
+  tasks: {
+    total: 0,
+    byStatus: { idle: 0, pending: 0, running: 0, succeeded: 0, failed: 0, cancelled: 0 },
+    successRate: 0,
+    failureRate: 0,
+    active: 0,
+    completed: 0,
+    averageDurationMs: null,
+    byErrorCategory: { connection: 0, auth: 0, timeout: 0, non_json: 0, field_mapping: 0, model_error: 0, other: 0 },
+  },
+  modelRuntime: {
+    providers: { total: 0, enabled: 0, disabled: 0 },
+    models: { total: 0, enabled: 0, disabled: 0, byType: {} },
+  },
+  events: {
+    summary: EMPTY_SYSTEM_EVENT_SUMMARY,
+    recentSignals: [],
+  },
+  backup: {
+    latest: null,
+    latestError: null,
+    total: 0,
+    errors: 0,
+    warnings: 0,
+  },
+  recentFailedTasks: [],
 };
 
 function parseParamSchema(schema: Record<string, unknown> | undefined): ParamSchemaEntry[] {
@@ -323,13 +361,21 @@ export function AdminPage() {
   const [providers, setProviders] = useState<Array<Record<string, unknown>>>([]);
   const [models, setModels] = useState<Array<Record<string, unknown>>>([]);
   const [tasks, setTasks] = useState<Record<string, unknown>[]>([]);
-  const [activeTab, setActiveTab] = useState<"models" | "providers" | "tasks">("models");
+  const [overview, setOverview] = useState<AdminOverview>(EMPTY_ADMIN_OVERVIEW);
+  const [systemEvents, setSystemEvents] = useState<SystemEventRecord[]>([]);
+  const [systemEventSummary, setSystemEventSummary] = useState<SystemEventSummary>(EMPTY_SYSTEM_EVENT_SUMMARY);
+  const [activeTab, setActiveTab] = useState<"overview" | "models" | "providers" | "tasks" | "logs">("overview");
   const [activeModelType, setActiveModelType] = useState("image");
   const [editingModel, setEditingModel] = useState<Record<string, unknown> | null>(null);
   const [editingProvider, setEditingProvider] = useState<Record<string, unknown> | null>(null);
   const [adminNotice, setAdminNotice] = useState("");
   const [selectedTask, setSelectedTask] = useState<AITask | null>(null);
   const [taskDetailLoading, setTaskDetailLoading] = useState(false);
+  const [taskStatusFilter, setTaskStatusFilter] = useState<NodeRuntimeStatus | "">("");
+  const [taskErrorFilter, setTaskErrorFilter] = useState<ErrorCategory | "">("");
+  const [batchRetryLoading, setBatchRetryLoading] = useState(false);
+  const [eventLevelFilter, setEventLevelFilter] = useState<SystemEventLevel | "">("");
+  const [eventCategoryFilter, setEventCategoryFilter] = useState<SystemEventCategory | "">("");
 
   // 供应商表单
   const [providerForm, setProviderForm] = useState({
@@ -358,8 +404,15 @@ export function AdminPage() {
   const [publicParamSchema, setPublicParamSchema] = useState<ParamSchemaEntry[]>([]);
   const [adapterConfig, setAdapterConfig] = useState<AdapterConfig>(DEFAULT_ADAPTER_CONFIG);
 
+  const reloadSystemEvents = () =>
+    listSystemEvents({ level: eventLevelFilter, category: eventCategoryFilter, limit: 100 }).then((eventResult) => {
+      setSystemEvents(eventResult.events);
+      setSystemEventSummary(eventResult.summary);
+    });
+
   const reloadAdmin = () =>
-    Promise.all([listProviders(), listModels(), listTasks()]).then(([providerResult, modelResult, taskResult]) => {
+    Promise.all([getOverview(), listProviders(), listModels(), listTasks(), reloadSystemEvents()]).then(([overviewResult, providerResult, modelResult, taskResult]) => {
+      setOverview(overviewResult.overview);
       setProviders(providerResult.providers);
       setModels(modelResult.models);
       setTasks(taskResult.tasks as unknown as Record<string, unknown>[]);
@@ -368,6 +421,10 @@ export function AdminPage() {
   useEffect(() => {
     reloadAdmin();
   }, []);
+
+  useEffect(() => {
+    reloadSystemEvents().catch((error) => setAdminNotice(error instanceof Error ? error.message : "获取运行日志失败"));
+  }, [eventLevelFilter, eventCategoryFilter]);
 
   // 供应商操作
   const saveProvider = async () => {
@@ -522,6 +579,26 @@ export function AdminPage() {
   };
 
   // 任务详情
+  const handleBatchRetryTasks = async () => {
+    const taskIds = filteredTasks
+      .filter((task) => task.status === "failed" || task.status === "cancelled")
+      .map((task) => String(task.id));
+    if (!taskIds.length) {
+      setAdminNotice("当前筛选下没有可重试任务");
+      return;
+    }
+    setBatchRetryLoading(true);
+    try {
+      const result = await retryTasksBatch({ taskIds, limit: 50 });
+      await reloadAdmin();
+      setAdminNotice(`已重新入队 ${result.retriedCount} 个任务${result.skipped.length ? `，跳过 ${result.skipped.length} 个` : ""}`);
+    } catch (error) {
+      setAdminNotice(error instanceof Error ? error.message : "批量重试失败");
+    } finally {
+      setBatchRetryLoading(false);
+    }
+  };
+
   const openTaskDetail = async (task: Record<string, unknown>) => {
     setTaskDetailLoading(true);
     setSelectedTask(null);
@@ -558,7 +635,73 @@ export function AdminPage() {
     return `${minutes}分${seconds}秒`;
   };
 
+  const formatDateTime = (value?: string | null): string => {
+    if (!value) return "-";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    return date.toLocaleString();
+  };
+
+  const eventLevelLabels: Record<SystemEventLevel, string> = {
+    info: "信息",
+    warning: "警告",
+    error: "错误",
+  };
+
+  const eventCategoryLabels: Record<SystemEventCategory, string> = {
+    system: "系统",
+    api: "API",
+    security: "安全",
+    task: "任务",
+    model: "模型",
+    backup: "备份",
+  };
+
+  const formatOverviewDuration = (ms?: number | null): string => {
+    if (ms === undefined || ms === null) return "-";
+    return formatDuration(ms);
+  };
+
+  const formatRate = (value: number): string => `${value.toFixed(1)}%`;
+
+  const statusLabels: Record<NodeRuntimeStatus, string> = {
+    idle: "空闲",
+    pending: "等待中",
+    running: "运行中",
+    succeeded: "成功",
+    failed: "失败",
+    cancelled: "已取消",
+  };
+
+  const modelTypeLabels: Record<string, string> = {
+    text: "文本",
+    image: "图片",
+    audio: "音频",
+    video: "视频",
+  };
+
+  const backupState = overview.backup.latestError
+    ? { label: "有错误", tone: "danger" }
+    : overview.backup.latest
+      ? { label: "已有记录", tone: "ok" }
+      : { label: "暂无记录", tone: "muted" };
+
+  const formatEventMetadata = (metadata?: Record<string, unknown>) => {
+    if (!metadata || Object.keys(metadata).length === 0) return "-";
+    return JSON.stringify(metadata, null, 2);
+  };
+
   // 参数编辑辅助
+  const filteredTasks = tasks.filter((task) => {
+    const status = String(task.status) as NodeRuntimeStatus;
+    const errorCategory = task.errorCategory as ErrorCategory | undefined;
+    if (taskStatusFilter && status !== taskStatusFilter) return false;
+    if (taskErrorFilter && errorCategory !== taskErrorFilter) return false;
+    return true;
+  });
+
+  const retryableFilteredTaskCount = filteredTasks.filter((task) => task.status === "failed" || task.status === "cancelled").length;
+
   const addParamEntry = (setter: React.Dispatch<React.SetStateAction<ParamSchemaEntry[]>>) => {
     setter((prev) => [...prev, createParamEntry()]);
   };
@@ -603,12 +746,197 @@ export function AdminPage() {
 
       {/* 标签页导航 */}
       <nav className="admin-tabs">
+        <button className={activeTab === "overview" ? "active" : ""} onClick={() => setActiveTab("overview")}>运维概览</button>
         <button className={activeTab === "models" ? "active" : ""} onClick={() => setActiveTab("models")}>模型管理</button>
         <button className={activeTab === "providers" ? "active" : ""} onClick={() => setActiveTab("providers")}>供应商</button>
         <button className={activeTab === "tasks" ? "active" : ""} onClick={() => setActiveTab("tasks")}>任务记录</button>
+        <button className={activeTab === "logs" ? "active" : ""} onClick={() => setActiveTab("logs")}>运行日志</button>
       </nav>
 
       {/* 模型管理 */}
+      {activeTab === "overview" && (
+        <section className="admin-section admin-overview">
+          <div className="overview-toolbar">
+            <div>
+              <h2>运维概览</h2>
+              <span>最后刷新：{formatDateTime(overview.generatedAt)}</span>
+            </div>
+            <button className="weui-btn weui-btn_mini weui-btn_default" onClick={() => reloadAdmin()}>刷新</button>
+          </div>
+
+          <div className="overview-card-grid">
+            <div className="overview-card overview-card-primary">
+              <span>任务总数</span>
+              <strong>{overview.tasks.total}</strong>
+              <small>{overview.tasks.active} 个等待/运行中</small>
+            </div>
+            <div className="overview-card overview-card-ok">
+              <span>成功率</span>
+              <strong>{formatRate(overview.tasks.successRate)}</strong>
+              <small>{overview.tasks.byStatus.succeeded} 个成功</small>
+            </div>
+            <div className="overview-card overview-card-danger">
+              <span>失败任务</span>
+              <strong>{overview.tasks.byStatus.failed}</strong>
+              <small>{formatRate(overview.tasks.failureRate)} 失败率</small>
+            </div>
+            <div className="overview-card">
+              <span>平均耗时</span>
+              <strong>{formatOverviewDuration(overview.tasks.averageDurationMs)}</strong>
+              <small>{overview.tasks.completed} 个已结束任务</small>
+            </div>
+            <div className="overview-card">
+              <span>启用模型</span>
+              <strong>{overview.modelRuntime.models.enabled}</strong>
+              <small>共 {overview.modelRuntime.models.total} 个模型</small>
+            </div>
+            <div className="overview-card">
+              <span>启用供应商</span>
+              <strong>{overview.modelRuntime.providers.enabled}</strong>
+              <small>共 {overview.modelRuntime.providers.total} 个供应商</small>
+            </div>
+            <div className="overview-card overview-card-warning">
+              <span>日志告警</span>
+              <strong>{overview.events.summary.byLevel.warning}</strong>
+              <small>{overview.events.summary.byLevel.error} 个错误</small>
+            </div>
+            <div className={`overview-card overview-card-${backupState.tone}`}>
+              <span>备份状态</span>
+              <strong>{backupState.label}</strong>
+              <small>{overview.backup.latest ? formatDateTime(overview.backup.latest.createdAt) : "暂无备份事件"}</small>
+            </div>
+          </div>
+
+          <div className="overview-main-grid">
+            <div className="overview-panel">
+              <div className="overview-panel-header">
+                <h3>任务状态</h3>
+                <button className="plain-link" onClick={() => setActiveTab("tasks")}>查看任务</button>
+              </div>
+              <div className="overview-status-list">
+                {(["pending", "running", "succeeded", "failed", "cancelled"] as NodeRuntimeStatus[]).map((status) => (
+                  <div key={status} className="overview-status-row">
+                    <span>{statusLabels[status]}</span>
+                    <strong>{overview.tasks.byStatus[status] || 0}</strong>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="overview-panel">
+              <div className="overview-panel-header">
+                <h3>错误分类</h3>
+                <button className="plain-link" onClick={() => setActiveTab("tasks")}>处理失败</button>
+              </div>
+              <div className="overview-error-grid">
+                {(Object.entries(overview.tasks.byErrorCategory) as Array<[ErrorCategory, number]>)
+                  .filter(([, count]) => count > 0)
+                  .map(([category, count]) => (
+                    <button
+                      key={category}
+                      className={`error-tag error-tag-${category} error-filter-button`}
+                      onClick={() => {
+                        setTaskErrorFilter(category);
+                        setTaskStatusFilter("failed");
+                        setActiveTab("tasks");
+                      }}
+                    >
+                      {errorCategoryLabels[category]} · {count}
+                    </button>
+                  ))}
+                {!Object.values(overview.tasks.byErrorCategory).some((count) => count > 0) && (
+                  <div className="overview-empty">暂无失败分类</div>
+                )}
+              </div>
+            </div>
+
+            <div className="overview-panel">
+              <div className="overview-panel-header">
+                <h3>模型分布</h3>
+                <button className="plain-link" onClick={() => setActiveTab("models")}>管理模型</button>
+              </div>
+              <div className="overview-status-list">
+                {Object.entries(overview.modelRuntime.models.byType).map(([type, count]) => (
+                  <div key={type} className="overview-status-row">
+                    <span>{modelTypeLabels[type] || type}</span>
+                    <strong>{count}</strong>
+                  </div>
+                ))}
+                {!Object.keys(overview.modelRuntime.models.byType).length && <div className="overview-empty">暂无模型</div>}
+              </div>
+            </div>
+
+            <div className="overview-panel">
+              <div className="overview-panel-header">
+                <h3>备份信号</h3>
+                <button className="plain-link" onClick={() => setActiveTab("logs")}>查看日志</button>
+              </div>
+              <div className="overview-status-list">
+                <div className="overview-status-row">
+                  <span>备份事件</span>
+                  <strong>{overview.backup.total}</strong>
+                </div>
+                <div className="overview-status-row">
+                  <span>备份错误</span>
+                  <strong>{overview.backup.errors}</strong>
+                </div>
+                <div className="overview-status-row">
+                  <span>最近错误</span>
+                  <strong>{overview.backup.latestError ? formatDateTime(overview.backup.latestError.createdAt) : "-"}</strong>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="overview-main-grid overview-main-grid-wide">
+            <div className="overview-panel">
+              <div className="overview-panel-header">
+                <h3>最近失败任务</h3>
+                <button className="plain-link" onClick={() => setActiveTab("tasks")}>打开任务列表</button>
+              </div>
+              <div className="overview-task-list">
+                {overview.recentFailedTasks.map((task) => (
+                  <button
+                    key={task.id}
+                    className="overview-task-row"
+                    onClick={() => {
+                      setActiveTab("tasks");
+                      openTaskDetail(task as unknown as Record<string, unknown>);
+                    }}
+                  >
+                    <span>
+                      <strong>{task.modelDisplayName || task.modelId || "-"}</strong>
+                      <small>{task.inputSummary || task.id}</small>
+                    </span>
+                    <i className={`error-tag error-tag-${task.errorCategory || "other"}`}>
+                      {errorCategoryLabels[task.errorCategory || "other"]}
+                    </i>
+                  </button>
+                ))}
+                {!overview.recentFailedTasks.length && <div className="overview-empty">暂无失败任务</div>}
+              </div>
+            </div>
+
+            <div className="overview-panel">
+              <div className="overview-panel-header">
+                <h3>最近告警/错误</h3>
+                <button className="plain-link" onClick={() => setActiveTab("logs")}>打开运行日志</button>
+              </div>
+              <div className="overview-signal-list">
+                {overview.events.recentSignals.map((event) => (
+                  <div key={event.id} className={`overview-signal-row overview-signal-${event.level}`}>
+                    <span>{formatDateTime(event.createdAt)}</span>
+                    <strong>{event.message}</strong>
+                    <small>{eventCategoryLabels[event.category]} · {event.source}</small>
+                  </div>
+                ))}
+                {!overview.events.recentSignals.length && <div className="overview-empty">暂无告警或错误</div>}
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
       {activeTab === "models" && (
         <section className="admin-section">
           {/* 模型类型切换 */}
@@ -946,6 +1274,33 @@ export function AdminPage() {
       {/* 任务记录 */}
       {activeTab === "tasks" && (
         <section className="admin-section">
+          <div className="task-toolbar">
+            <div className="task-filter-group">
+              <select value={taskStatusFilter} onChange={(event) => setTaskStatusFilter(event.target.value as NodeRuntimeStatus | "")}>
+                <option value="">全部状态</option>
+                <option value="pending">等待中</option>
+                <option value="running">运行中</option>
+                <option value="succeeded">成功</option>
+                <option value="failed">失败</option>
+                <option value="cancelled">已取消</option>
+              </select>
+              <select value={taskErrorFilter} onChange={(event) => setTaskErrorFilter(event.target.value as ErrorCategory | "")}>
+                <option value="">全部错误分类</option>
+                {Object.entries(errorCategoryLabels).map(([value, label]) => (
+                  <option key={value} value={value}>{label}</option>
+                ))}
+              </select>
+              {(taskStatusFilter || taskErrorFilter) && (
+                <button className="weui-btn weui-btn_mini weui-btn_default" onClick={() => { setTaskStatusFilter(""); setTaskErrorFilter(""); }}>清除筛选</button>
+              )}
+            </div>
+            <div className="task-bulk-actions">
+              <span>当前 {filteredTasks.length} 个，{retryableFilteredTaskCount} 个可重试</span>
+              <button className="weui-btn weui-btn_mini weui-btn_primary" disabled={!retryableFilteredTaskCount || batchRetryLoading} onClick={handleBatchRetryTasks}>
+                {batchRetryLoading ? "重试中..." : "批量重试"}
+              </button>
+            </div>
+          </div>
           <div className="task-list">
             <div className="task-header">
               <span>类型</span>
@@ -955,7 +1310,7 @@ export function AdminPage() {
               <span>耗时</span>
               <span>操作</span>
             </div>
-            {tasks.slice(0, 50).map((task) => {
+            {filteredTasks.slice(0, 50).map((task) => {
               const status = String(task.status);
               const canCancel = status === "pending" || status === "running";
               const canRetry = status === "failed" || status === "cancelled";
@@ -984,6 +1339,7 @@ export function AdminPage() {
                 </div>
               );
             })}
+            {!filteredTasks.length && tasks.length > 0 && <div className="empty-state">暂无匹配任务</div>}
             {!tasks.length && <div className="empty-state">暂无任务记录</div>}
           </div>
 
@@ -1023,8 +1379,20 @@ export function AdminPage() {
                   <span className="detail-value">{selectedTask.createdAt || "-"}</span>
                 </div>
                 <div className="detail-row">
+                  <span className="detail-label">开始时间</span>
+                  <span className="detail-value">{selectedTask.startedAt || "-"}</span>
+                </div>
+                <div className="detail-row">
                   <span className="detail-label">耗时</span>
                   <span className="detail-value">{formatDuration(selectedTask.durationMs)}</span>
+                </div>
+                <div className="detail-row">
+                  <span className="detail-label">模型等待上限</span>
+                  <span className="detail-value">{formatDuration(selectedTask.timeoutMs)}</span>
+                </div>
+                <div className="detail-row">
+                  <span className="detail-label">轮询间隔</span>
+                  <span className="detail-value">{formatDuration(selectedTask.pollIntervalMs)}</span>
                 </div>
                 {selectedTask.inputSummary && (
                   <div className="detail-row detail-row-block">
@@ -1078,6 +1446,71 @@ export function AdminPage() {
               )}
             </div>
           )}
+        </section>
+      )}
+
+      {/* 运行日志 */}
+      {activeTab === "logs" && (
+        <section className="admin-section">
+          <div className="event-summary-grid">
+            <div className="event-summary-card">
+              <span>事件总数</span>
+              <strong>{systemEventSummary.total}</strong>
+            </div>
+            <div className="event-summary-card event-summary-error">
+              <span>错误</span>
+              <strong>{systemEventSummary.byLevel.error}</strong>
+            </div>
+            <div className="event-summary-card event-summary-warning">
+              <span>警告</span>
+              <strong>{systemEventSummary.byLevel.warning}</strong>
+            </div>
+            <div className="event-summary-card">
+              <span>最近错误</span>
+              <strong>{formatDateTime(systemEventSummary.latestErrorAt)}</strong>
+            </div>
+          </div>
+
+          <div className="event-toolbar">
+            <select value={eventLevelFilter} onChange={(event) => setEventLevelFilter(event.target.value as SystemEventLevel | "")}>
+              <option value="">全部等级</option>
+              <option value="info">信息</option>
+              <option value="warning">警告</option>
+              <option value="error">错误</option>
+            </select>
+            <select value={eventCategoryFilter} onChange={(event) => setEventCategoryFilter(event.target.value as SystemEventCategory | "")}>
+              <option value="">全部分类</option>
+              <option value="system">系统</option>
+              <option value="api">API</option>
+              <option value="security">安全</option>
+              <option value="task">任务</option>
+              <option value="model">模型</option>
+              <option value="backup">备份</option>
+            </select>
+            <button className="weui-btn weui-btn_mini weui-btn_default" onClick={() => reloadSystemEvents()}>刷新</button>
+          </div>
+
+          <div className="event-list">
+            <div className="event-header">
+              <span>时间</span>
+              <span>等级</span>
+              <span>分类</span>
+              <span>来源</span>
+              <span>消息</span>
+              <span>元数据</span>
+            </div>
+            {systemEvents.map((event) => (
+              <div key={event.id} className={`event-row event-row-${event.level}`}>
+                <span>{formatDateTime(event.createdAt)}</span>
+                <span><i className={`event-level event-level-${event.level}`}>{eventLevelLabels[event.level]}</i></span>
+                <span>{eventCategoryLabels[event.category]}</span>
+                <span>{event.source}</span>
+                <strong>{event.message}</strong>
+                <code>{formatEventMetadata(event.metadata)}</code>
+              </div>
+            ))}
+            {!systemEvents.length && <div className="empty-state">暂无运行日志</div>}
+          </div>
         </section>
       )}
 

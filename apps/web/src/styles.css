@@ -843,9 +843,9 @@ textarea {
   top: -58px;
   left: 50%;
   display: flex;
-  gap: 14px;
+  gap: 8px;
   align-items: center;
-  padding: 10px 18px;
+  padding: 7px 12px;
   color: rgba(255, 255, 255, 0.9);
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 999px;
@@ -855,13 +855,39 @@ textarea {
   backdrop-filter: blur(18px);
 }
 
-.node-floating-toolbar span {
+.node-floating-toolbar button {
   display: grid;
   place-items: center;
-  min-width: 14px;
-  height: 16px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  color: rgba(255, 255, 255, 0.86);
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
   font-size: 13px;
   font-weight: 800;
+  line-height: 1;
+  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+}
+
+.node-floating-toolbar button:hover,
+.node-floating-toolbar button.active {
+  color: #171820;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 0 22px rgba(255, 255, 255, 0.28);
+}
+
+.node-floating-toolbar button:disabled {
+  cursor: not-allowed;
+  opacity: 0.32;
+  box-shadow: none;
+}
+
+.node-floating-toolbar button:disabled:hover {
+  color: rgba(255, 255, 255, 0.86);
+  background: transparent;
 }
 
 .node-card::before {
@@ -890,6 +916,30 @@ textarea {
     0 28px 74px rgba(0, 0, 0, 0.42),
     0 0 0 4px rgba(109, 93, 252, 0.22),
     0 0 36px rgba(109, 93, 252, 0.35);
+}
+
+.node-card.trace-target {
+  border-color: rgba(255, 255, 255, 0.88);
+  box-shadow:
+    0 28px 76px rgba(0, 0, 0, 0.45),
+    0 0 0 4px rgba(255, 255, 255, 0.14),
+    0 0 34px rgba(255, 255, 255, 0.22);
+}
+
+.node-card.trace-upstream {
+  border-color: rgba(54, 209, 220, 0.92);
+  box-shadow:
+    0 28px 76px rgba(0, 0, 0, 0.42),
+    0 0 0 4px rgba(54, 209, 220, 0.16),
+    0 0 32px rgba(54, 209, 220, 0.24);
+}
+
+.node-card.trace-downstream {
+  border-color: rgba(248, 91, 189, 0.9);
+  box-shadow:
+    0 28px 76px rgba(0, 0, 0, 0.42),
+    0 0 0 4px rgba(248, 91, 189, 0.15),
+    0 0 32px rgba(248, 91, 189, 0.24);
 }
 
 .node-card.running {
@@ -1172,6 +1222,130 @@ textarea {
 .node-result-actions button:hover,
 .node-prompt-tools button:hover {
   background: rgba(139, 108, 255, 0.45);
+}
+
+.node-diagnostics {
+  margin: -2px 10px 10px;
+  padding: 10px;
+  color: rgba(238, 242, 255, 0.88);
+  border: 1px solid rgba(148, 163, 255, 0.16);
+  border-radius: 14px;
+  background: rgba(8, 10, 20, 0.62);
+}
+
+.node-diagnostics.has-issues {
+  border-color: rgba(251, 191, 36, 0.3);
+  background: rgba(251, 191, 36, 0.08);
+}
+
+.node-diagnostics.ready {
+  border-color: rgba(16, 185, 129, 0.26);
+  background: rgba(16, 185, 129, 0.08);
+}
+
+.node-diagnostics-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.node-diagnostics-head strong {
+  font-size: 12px;
+}
+
+.node-diagnostics-head span,
+.node-diagnostics-section > span {
+  color: rgba(226, 232, 255, 0.58);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.node-diagnostics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 9px;
+}
+
+.node-diagnostics-grid div {
+  min-width: 0;
+  padding: 7px 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.node-diagnostics-grid span,
+.node-diagnostics-grid strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-diagnostics-grid span {
+  color: rgba(226, 232, 255, 0.54);
+  font-size: 10px;
+}
+
+.node-diagnostics-grid strong {
+  margin-top: 2px;
+  color: #fff;
+  font-size: 15px;
+}
+
+.node-diagnostics-section {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.node-diagnostics-section p,
+.node-diagnostics-ok {
+  margin: 0;
+  padding: 0;
+  color: rgba(226, 232, 255, 0.7);
+  border: 0;
+  background: transparent;
+  font-size: 12px;
+}
+
+.node-diagnostics-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.node-diagnostics-list em {
+  max-width: 142px;
+  overflow: hidden;
+  padding: 4px 7px;
+  color: rgba(238, 242, 255, 0.78);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  font-size: 11px;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-diagnostics-list em.ready {
+  background: rgba(16, 185, 129, 0.18);
+}
+
+.node-diagnostics-list em.empty {
+  background: rgba(251, 191, 36, 0.14);
+}
+
+.node-diagnostics ul {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-left: 16px;
+  color: #ffe08a;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .node-expanded-panel {
@@ -1565,13 +1739,31 @@ textarea {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 10px;
   color: rgba(238, 242, 255, 0.8);
   font-size: 13px;
 }
 
+.node-text-overlay-header > span {
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-text-overlay-header > div {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
 .node-text-overlay-header button {
-  width: 26px;
+  width: auto;
+  min-width: 26px;
   height: 26px;
+  padding: 0 8px;
   border-radius: 8px;
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: rgba(255, 255, 255, 0.06);

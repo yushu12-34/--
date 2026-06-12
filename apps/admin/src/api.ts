@@ -1,4 +1,4 @@
-import type { AITask } from "./types";
+import type { AdminOverview, AITask, SystemEventCategory, SystemEventLevel, SystemEventRecord, SystemEventSummary } from "./types";
 
 const INTERNAL_API_BASE_URL = import.meta.env.VITE_INTERNAL_API_BASE_URL || "/internal";
 const INTERNAL_ADMIN_TOKEN = import.meta.env.VITE_INTERNAL_ADMIN_TOKEN || "";
@@ -23,6 +23,19 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 export function listTasks() {
   return request<{ tasks: AITask[] }>("/tasks");
+}
+
+export function getOverview() {
+  return request<{ overview: AdminOverview }>("/overview");
+}
+
+export function listSystemEvents(filters: { level?: SystemEventLevel | ""; category?: SystemEventCategory | ""; limit?: number } = {}) {
+  const params = new URLSearchParams();
+  if (filters.level) params.set("level", filters.level);
+  if (filters.category) params.set("category", filters.category);
+  if (filters.limit) params.set("limit", String(filters.limit));
+  const query = params.toString();
+  return request<{ events: SystemEventRecord[]; summary: SystemEventSummary }>(`/system-events${query ? `?${query}` : ""}`);
 }
 
 export function getTask(id: string) {
@@ -80,5 +93,12 @@ export function cancelTask(id: string) {
 export function retryTask(id: string) {
   return request<{ task: AITask }>(`/tasks/${encodeURIComponent(id)}/retry`, {
     method: "POST",
+  });
+}
+
+export function retryTasksBatch(payload: { taskIds?: string[]; errorCategory?: string; statuses?: string[]; limit?: number }) {
+  return request<{ retried: AITask[]; retriedCount: number; requestedCount: number; skipped: Array<Record<string, unknown>>; limit: number }>("/tasks/retry-batch", {
+    method: "POST",
+    body: JSON.stringify(payload),
   });
 }

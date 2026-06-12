@@ -127,10 +127,17 @@ export function deleteCanvas(canvasId: string) {
   });
 }
 
-export function saveSnapshot(canvasId: string, snapshot: CanvasSnapshot) {
+export function saveSnapshot(canvasId: string, snapshot: CanvasSnapshot, options: { backupOperation?: "history-restore" } = {}) {
   return request<{ canvas: CanvasRecord }>(`/canvases/${canvasId}/snapshot`, {
     method: "PUT",
-    body: JSON.stringify({ snapshot }),
+    body: JSON.stringify({ snapshot, ...options }),
+  });
+}
+
+export function saveSnapshotJson(canvasId: string, bodyJson: string) {
+  return request<{ canvas: CanvasRecord }>(`/canvases/${canvasId}/snapshot`, {
+    method: "PUT",
+    body: bodyJson,
   });
 }
 

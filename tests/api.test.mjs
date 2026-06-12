@@ -1,8 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import * as Y from "../apps/api/node_modules/yjs/dist/yjs.mjs";
 import { applyEncodedYUpdate, createYjsSyncPayload, decodeYUpdate, encodeYUpdate, sanitizeAwarenessWireState } from "../apps/api/src/services/collaborationService.js";
+import { buildAdminOverview, enrichAdminTask, selectRetryableAdminTasks } from "../apps/api/src/services/adminOverviewService.js";
+import { createDbBackup, createRequiredDbBackup } from "../apps/api/src/services/backupService.js";
 import { buildProjectBundle, buildProjectList, copyProject, deleteProjectGraph, importProjectBundle, validateProjectBundle } from "../apps/api/src/services/projectArchiveService.js";
+import { appendSystemEvent, listSystemEvents } from "../apps/api/src/services/systemEventService.js";
+import { resolveTaskRuntimeConfig } from "../apps/api/src/services/taskService.js";
 import { buildYDocFromPersistence, getCanvasYjsPersistence, getCanvasYjsSnapshotDetail, listCanvasYjsSnapshots } from "../apps/api/src/services/yjsPersistenceService.js";
 import { renderAdapterTemplate } from "../apps/api/src/services/imageGeneration.js";
 import { isInternalAdminRequest, publicModel, publicProvider } from "../apps/api/src/utils/http.js";
@@ -92,6 +99,21 @@ test("publicModel preserves structured public param schema without internal flag
   assert.equal(model.publicParamSchema.privateSeed, undefined);
   assert.equal(model.defaultPublicParams.privateSeed, undefined);
   assert.equal(model.adapter, undefined);
+});
+
+test("task runtime config is resolved from the selected model adapter", () => {
+  const db = {
+    models: [
+      { id: "fast", adapter: { timeoutMs: 45000, pollIntervalMs: 1200 } },
+      { id: "slow", adapter: { timeoutMs: 300000, pollIntervalMs: 5000 } },
+      { id: "invalid", adapter: { timeoutMs: 0, pollIntervalMs: -1 } },
+    ],
+  };
+
+  assert.deepEqual(resolveTaskRuntimeConfig(db, "fast"), { timeoutMs: 45000, pollIntervalMs: 1200 });
+  assert.deepEqual(resolveTaskRuntimeConfig(db, "slow"), { timeoutMs: 300000, pollIntervalMs: 5000 });
+  assert.deepEqual(resolveTaskRuntimeConfig(db, "missing"), { timeoutMs: 120000, pollIntervalMs: 2000 });
+  assert.deepEqual(resolveTaskRuntimeConfig(db, "invalid"), { timeoutMs: 120000, pollIntervalMs: 2000 });
 });
 
 test("internal admin request uses token in production and local fallback in development", () => {
@@ -417,4 +439,233 @@ test("project bundle validation rejects incompatible imports", () => {
     workflowUpdates: [],
     workflowSnapshots: [],
   }).ok, true);
+});
+
+test("createDbBackup copies db.json into operation-specific backup file", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "anime-canvas-backup-"));
+  try {
+    const dbFile = path.join(dir, "db.json");
+    const backupDir = path.join(dir, "backups");
+    await writeFile(dbFile, JSON.stringify({ projects: [{ id: "project:a" }] }), "utf8");
+
+    const backup = await createDbBackup("project import", {
+      dbFile,
+      backupDir,
+      now: new Date("2026-06-11T10:00:00.000Z"),
+    });
+
+    assert.equal(backup.operation, "project-import");
+    assert.ok(backup.file.endsWith("2026-06-11T10-00-00-000Z_project-import.db.json"));
+    assert.deepEqual(JSON.parse(await readFile(backup.file, "utf8")), { projects: [{ id: "project:a" }] });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("createRequiredDbBackup blocks dangerous writes when backup fails", async () => {
+  await assert.rejects(
+    () => createRequiredDbBackup("history-restore", {
+      dbFile: path.join(os.tmpdir(), "missing-anime-canvas-db.json"),
+      backupDir: path.join(os.tmpdir(), "anime-canvas-backups"),
+    }),
+    (error) => {
+      assert.equal(error.code, "DB_BACKUP_FAILED");
+      assert.equal(error.operation, "history-restore");
+      assert.match(error.message, /数据备份失败/);
+      return true;
+    },
+  );
+});
+
+test("system events are sanitized, summarized, filtered and capped", () => {
+  const db = { systemEvents: [] };
+
+  appendSystemEvent(db, {
+    id: "event:1",
+    level: "error",
+    category: "api",
+    source: "test",
+    message: "API failed",
+    metadata: {
+      authorization: "Bearer secret",
+      nested: { apiKey: "key-value", visible: "ok" },
+      longText: "x".repeat(700),
+    },
+    createdAt: "2026-06-11T00:00:00.000Z",
+  });
+
+  appendSystemEvent(db, {
+    id: "event:2",
+    level: "warning",
+    category: "security",
+    source: "test",
+    message: "Unauthorized",
+    metadata: { path: "/internal/providers" },
+    createdAt: "2026-06-11T00:01:00.000Z",
+  }, { maxEvents: 2 });
+
+  appendSystemEvent(db, {
+    id: "event:3",
+    level: "info",
+    category: "system",
+    source: "test",
+    message: "Started",
+    createdAt: "2026-06-11T00:02:00.000Z",
+  }, { maxEvents: 2 });
+
+  assert.equal(db.systemEvents.length, 2);
+  assert.equal(db.systemEvents[0].id, "event:3");
+  assert.equal(db.systemEvents[1].id, "event:2");
+
+  const fullDb = {
+    systemEvents: [
+      db.systemEvents[0],
+      db.systemEvents[1],
+      {
+        id: "event:1",
+        level: "error",
+        category: "api",
+        source: "test",
+        message: "API failed",
+        metadata: {
+          authorization: "[redacted]",
+          nested: { apiKey: "[redacted]", visible: "ok" },
+          longText: "x".repeat(500) + "...",
+        },
+        createdAt: "2026-06-11T00:00:00.000Z",
+      },
+    ],
+  };
+
+  const listed = listSystemEvents(fullDb);
+  assert.equal(listed.summary.total, 3);
+  assert.equal(listed.summary.byLevel.error, 1);
+  assert.equal(listed.summary.byLevel.warning, 1);
+  assert.equal(listed.summary.byCategory.security, 1);
+  assert.equal(listed.summary.latestErrorAt, "2026-06-11T00:00:00.000Z");
+
+  const errors = listSystemEvents(fullDb, { level: "error" });
+  assert.equal(errors.events.length, 1);
+  assert.equal(errors.events[0].metadata.authorization, "[redacted]");
+  assert.equal(errors.events[0].metadata.nested.apiKey, "[redacted]");
+  assert.equal(errors.events[0].metadata.nested.visible, "ok");
+  assert.equal(errors.events[0].metadata.longText.length, 503);
+
+  const security = listSystemEvents(fullDb, { category: "security" });
+  assert.equal(security.events.length, 1);
+  assert.equal(security.events[0].message, "Unauthorized");
+});
+
+test("admin overview summarizes task health, runtime signals and backups", () => {
+  const db = {
+    providers: [
+      { id: "provider:enabled", name: "Enabled Provider", enabled: true },
+      { id: "provider:disabled", name: "Disabled Provider", enabled: false },
+    ],
+    models: [
+      { id: "model:image", providerId: "provider:enabled", displayName: "Image Model", type: "image", enabled: true },
+      { id: "model:video", providerId: "provider:disabled", displayName: "Video Model", type: "video", enabled: false },
+    ],
+    tasks: [
+      {
+        id: "task:success",
+        modelId: "model:image",
+        type: "image.generate",
+        status: "succeeded",
+        input: { prompt: "finished image" },
+        createdAt: "2026-06-11T00:00:00.000Z",
+        updatedAt: "2026-06-11T00:00:02.000Z",
+      },
+      {
+        id: "task:failed",
+        modelId: "model:video",
+        type: "video.generate",
+        status: "failed",
+        input: { prompt: "failed video" },
+        error: "connection refused by model provider",
+        createdAt: "2026-06-11T00:01:00.000Z",
+        updatedAt: "2026-06-11T00:01:04.000Z",
+      },
+      {
+        id: "task:running",
+        modelId: "model:image",
+        type: "image.generate",
+        status: "running",
+        input: { prompt: "running image" },
+        createdAt: "2026-06-11T00:02:00.000Z",
+        updatedAt: "2026-06-11T00:02:01.000Z",
+      },
+    ],
+    systemEvents: [
+      { id: "event:backup", level: "info", category: "backup", source: "test", message: "backup ok", createdAt: "2026-06-11T00:03:00.000Z" },
+      { id: "event:warn", level: "warning", category: "security", source: "test", message: "warning", createdAt: "2026-06-11T00:02:30.000Z" },
+      { id: "event:error", level: "error", category: "api", source: "test", message: "error", createdAt: "2026-06-11T00:02:00.000Z" },
+    ],
+  };
+
+  const overview = buildAdminOverview(db);
+  assert.equal(overview.tasks.total, 3);
+  assert.equal(overview.tasks.byStatus.succeeded, 1);
+  assert.equal(overview.tasks.byStatus.failed, 1);
+  assert.equal(overview.tasks.active, 1);
+  assert.equal(overview.tasks.successRate, 33.3);
+  assert.equal(overview.tasks.failureRate, 33.3);
+  assert.equal(overview.tasks.averageDurationMs, 3000);
+  assert.equal(overview.tasks.byErrorCategory.connection, 1);
+  assert.equal(overview.recentFailedTasks[0].providerName, "Disabled Provider");
+  assert.equal(overview.modelRuntime.models.enabled, 1);
+  assert.equal(overview.modelRuntime.models.disabled, 1);
+  assert.equal(overview.modelRuntime.models.byType.image, 1);
+  assert.equal(overview.modelRuntime.providers.enabled, 1);
+  assert.equal(overview.events.summary.byLevel.error, 1);
+  assert.equal(overview.events.recentSignals.length, 2);
+  assert.equal(overview.backup.latest.id, "event:backup");
+  assert.equal(overview.backup.total, 1);
+});
+
+test("admin task enrichment exposes display names, duration and input summary", () => {
+  const task = enrichAdminTask(
+    {
+      id: "task:1",
+      modelId: "model:1",
+      status: "failed",
+      input: { prompt: "x".repeat(220) },
+      error: "unauthorized request",
+      createdAt: "2026-06-11T00:00:00.000Z",
+      startedAt: "2026-06-11T00:00:10.000Z",
+      updatedAt: "2026-06-11T00:00:11.500Z",
+    },
+    [{ id: "model:1", providerId: "provider:1", displayName: "Private Model" }],
+    [{ id: "provider:1", name: "Private Provider" }],
+  );
+
+  assert.equal(task.modelDisplayName, "Private Model");
+  assert.equal(task.providerName, "Private Provider");
+  assert.equal(task.durationMs, 1500);
+  assert.equal(task.errorCategory, "auth");
+  assert.equal(task.inputSummary.length, 203);
+  assert.ok(task.inputSummary.endsWith("..."));
+});
+
+test("selectRetryableAdminTasks filters by status, error category and explicit ids", () => {
+  const tasks = [
+    { id: "failed:connection", status: "failed", errorCategory: "connection" },
+    { id: "failed:timeout", status: "failed", errorCategory: "timeout" },
+    { id: "cancelled:other", status: "cancelled", errorCategory: "other" },
+    { id: "running:connection", status: "running", errorCategory: "connection" },
+    { id: "succeeded:connection", status: "succeeded", errorCategory: "connection" },
+  ];
+
+  const connection = selectRetryableAdminTasks(tasks, { errorCategory: "connection" });
+  assert.deepEqual(connection.selected.map((task) => task.id), ["failed:connection"]);
+
+  const explicit = selectRetryableAdminTasks(tasks, {
+    taskIds: ["failed:connection", "running:connection", "cancelled:other"],
+  });
+  assert.deepEqual(explicit.selected.map((task) => task.id), ["failed:connection", "cancelled:other"]);
+  assert.deepEqual(explicit.skipped, [{ taskId: "running:connection", reason: "status", status: "running" }]);
+
+  const limited = selectRetryableAdminTasks(tasks, { limit: 1 });
+  assert.equal(limited.selected.length, 1);
+  assert.equal(limited.skipped.some((item) => item.reason === "limit"), true);
 });
