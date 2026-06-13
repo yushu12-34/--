@@ -4,6 +4,7 @@ import IORedis from "ioredis";
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const QUEUE_PREFIX = process.env.QUEUE_PREFIX || "anime-canvas";
 const IMAGE_CONCURRENCY = Number(process.env.IMAGE_QUEUE_CONCURRENCY || 2);
+const QUEUE_MODE = process.env.TASK_QUEUE_MODE || "local";
 const queueOptions = {
   defaultJobOptions: {
     attempts: Number(process.env.TASK_RETRY_ATTEMPTS || 2),
@@ -19,34 +20,39 @@ let redisReady = false;
 let localRunner = null;
 
 function createRedisConnection() {
-  return new IORedis(REDIS_URL, {
+  const connection = new IORedis(REDIS_URL, {
     maxRetriesPerRequest: null,
     enableReadyCheck: false,
     lazyConnect: true,
   });
+  connection.on("error", () => {});
+  return connection;
 }
 
 export async function initializeTaskQueue(processTask) {
   localRunner = processTask;
-  if (process.env.TASK_QUEUE_MODE === "local") return { mode: "local" };
+  if (QUEUE_MODE !== "bullmq") return { mode: "local" };
 
   const connection = createRedisConnection();
   try {
     await connection.connect();
     await connection.ping();
   } catch (error) {
-    await connection.quit().catch(() => {});
+    connection.disconnect();
     console.warn(`任务队列使用本地回退：${error instanceof Error ? error.message : String(error)}`);
     return { mode: "local" };
   }
 
   redisReady = true;
   imageQueue = new Queue(`${QUEUE_PREFIX}:image`, { connection, ...queueOptions });
+  const workerConnection = createRedisConnection();
   imageWorker = new Worker(
     `${QUEUE_PREFIX}:image`,
     async (job) => processTask(job.data.taskId),
-    { connection: createRedisConnection(), concurrency: IMAGE_CONCURRENCY },
+    { connection: workerConnection, concurrency: IMAGE_CONCURRENCY },
   );
+  imageQueue.on("error", () => {});
+  imageWorker.on("error", () => {});
   imageWorker.on("failed", (job, error) => {
     console.warn(`任务 ${job?.data?.taskId || job?.id} 执行失败：${error.message}`);
   });

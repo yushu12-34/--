@@ -119,7 +119,7 @@ scripts/   本地环境安装、启动、停止脚本
 
 ## 当前边界
 
-当前图片生成已支持 Z-Image / Z-Image Turbo / SD WebUI 适配器，并具备 Redis/BullMQ 队列和 MinIO 存储的可选接入；当 Redis 不可用时会回退到本进程本地队列，当 MinIO 未配置时会保留远程 URL 或内联数据。
+当前图片生成已支持 Z-Image / Z-Image Turbo / SD WebUI 适配器，并具备 Redis/BullMQ 队列和 MinIO 存储的可选接入；本地开发默认使用本进程本地队列，需要 BullMQ 时显式设置 `TASK_QUEUE_MODE=bullmq` 和 Redis 连接，当 MinIO 未配置时会保留远程 URL 或内联数据。
 
 仍需注意的边界：
 

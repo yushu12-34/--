@@ -1,4 +1,4 @@
-import { getNodeDefinition } from "./nodeDefinitions";
+import { getNodeDefinition } from "./nodeDefinitions.ts";
 import type { MediaType, WorkflowEdge, WorkflowNode } from "./types";
 
 interface PortLookup {

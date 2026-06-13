@@ -779,6 +779,123 @@ textarea {
   opacity: 0.42;
 }
 
+.connection-node-picker {
+  position: fixed;
+  z-index: 95;
+  width: min(292px, calc(100vw - 24px));
+  max-height: min(360px, calc(100vh - 92px));
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  padding: 8px;
+  color: rgba(238, 242, 255, 0.9);
+  border: 1px solid rgba(148, 163, 255, 0.22);
+  border-radius: 8px;
+  background: rgba(18, 19, 24, 0.98);
+  box-shadow: 0 22px 56px rgba(0, 0, 0, 0.44);
+  backdrop-filter: blur(18px);
+}
+
+.connection-node-picker-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 2px 7px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.connection-node-picker-head span {
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 12px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connection-node-picker-head button {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  flex: 0 0 auto;
+  color: rgba(255, 255, 255, 0.72);
+  border: 0;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  cursor: pointer;
+}
+
+.connection-node-picker-list {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  gap: 6px;
+  padding-top: 8px;
+}
+
+.connection-node-picker-list button {
+  width: 100%;
+  min-height: 50px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  padding: 8px;
+  color: #fff;
+  text-align: left;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  cursor: pointer;
+}
+
+.connection-node-picker-list button:hover {
+  border-color: rgba(54, 209, 220, 0.34);
+  background: rgba(109, 93, 252, 0.28);
+}
+
+.connection-node-picker-icon {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  color: #fff;
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(54, 209, 220, 0.9), rgba(109, 93, 252, 0.86));
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.connection-node-picker-list strong,
+.connection-node-picker-list em {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connection-node-picker-list strong {
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.connection-node-picker-list em {
+  margin-top: 2px;
+  color: rgba(226, 232, 255, 0.56);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.connection-node-picker-empty {
+  padding: 12px 10px;
+  color: rgba(226, 232, 255, 0.58);
+  font-size: 12px;
+  text-align: center;
+}
+
 .node-card {
   position: relative;
   width: 286px;
@@ -2376,16 +2493,16 @@ textarea {
   cursor: pointer;
 }
 
-.asset-filters,
-.asset-actions,
+.asset-drawer .asset-filters,
+.asset-drawer .asset-actions,
 .asset-preview-card footer {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
 }
 
-.asset-filters button,
-.asset-actions button,
+.asset-drawer .asset-filters button,
+.asset-drawer .asset-actions button,
 .asset-preview-card footer button {
   padding: 7px 10px;
   color: #fff;
@@ -2396,22 +2513,23 @@ textarea {
   cursor: pointer;
 }
 
-.asset-filters button.active,
-.asset-actions button:hover,
+.asset-drawer .asset-filters button.active,
+.asset-drawer .asset-actions button:hover,
 .asset-preview-card footer button:hover {
   background: rgba(139, 108, 255, 0.5);
 }
 
-.asset-grid {
+.asset-drawer .asset-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: 1fr;
   gap: 12px;
   min-height: 0;
-  overflow: auto;
-  padding-right: 4px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0 4px 0 0;
 }
 
-.asset-empty {
+.asset-drawer .asset-empty {
   grid-column: 1 / -1;
   padding: 32px 18px;
   text-align: center;
@@ -2420,45 +2538,73 @@ textarea {
   border-radius: 18px;
 }
 
-.asset-card {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
+.asset-drawer .asset-card {
+  display: grid;
+  grid-template-columns: 116px minmax(0, 1fr);
+  grid-template-areas:
+    "thumb meta"
+    "actions actions";
+  gap: 10px 12px;
+  min-width: 0;
   padding: 10px;
   border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 18px;
+  border-radius: 8px;
   background: rgba(255, 255, 255, 0.07);
 }
 
-.asset-thumb {
+.asset-drawer .asset-thumb {
+  grid-area: thumb;
   width: 100%;
-  aspect-ratio: 1 / 0.72;
+  aspect-ratio: 1 / 0.76;
   overflow: hidden;
   color: #fff;
   border: 0;
-  border-radius: 14px;
-  background: linear-gradient(135deg, rgba(139, 108, 255, 0.35), rgba(54, 209, 220, 0.18));
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.24);
   cursor: zoom-in;
 }
 
-.asset-thumb img {
+.asset-drawer .asset-thumb img {
+  display: block;
   width: 100%;
   height: 100%;
   object-fit: cover;
 }
 
-.asset-meta {
+.asset-drawer .asset-meta {
+  grid-area: meta;
   min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
 
-.asset-meta strong {
+.asset-drawer .asset-meta strong {
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
+  word-break: break-all;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   font-size: 13px;
+}
+
+.asset-drawer .asset-actions {
+  grid-area: actions;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.asset-drawer .asset-actions button {
+  min-width: 0;
+  min-height: 30px;
+  padding: 6px 4px;
+  overflow: hidden;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-radius: 8px;
 }
 
 .asset-preview {
@@ -2883,20 +3029,20 @@ textarea {
   border: 1px solid var(--line);
 }
 
-.asset-grid {
+.inspector .asset-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 8px;
 }
 
-.asset-grid:empty::after {
+.inspector .asset-grid:empty::after {
   content: "褰撳墠鑺傜偣绫诲瀷鏆傛棤绱犳潗";
   grid-column: 1 / -1;
   color: #8790a6;
   font-size: 12px;
 }
 
-.asset-grid button {
+.inspector .asset-grid button {
   min-height: 58px;
   border: 1px solid var(--line);
   border-radius: 12px;
@@ -2905,7 +3051,7 @@ textarea {
   cursor: pointer;
 }
 
-.asset-grid img {
+.inspector .asset-grid img {
   width: 100%;
   height: 58px;
   object-fit: cover;

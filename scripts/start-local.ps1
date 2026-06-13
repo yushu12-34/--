@@ -130,7 +130,7 @@ $apiProcess = Start-LocalService `
   -Name "API on http://localhost:$($env:API_PORT)" `
   -WorkingDirectory "$root\apps\api" `
   -Command $nodeCommand `
-  -Arguments @("--watch", "src/server.js") `
+  -Arguments @("src/server.js") `
   -StdOut $apiOut `
   -StdErr $apiErr
 

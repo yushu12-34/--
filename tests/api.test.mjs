@@ -421,6 +421,26 @@ test("project list exposes management summary counts", () => {
   assert.equal(listed[0].updatedAt, "2026-06-09T00:09:00.000Z");
 });
 
+test("project list sorts by latest activity first", () => {
+  const db = {
+    projects: [
+      { id: "project:old", name: "Old", ownerId: "user:1", createdAt: "2026-06-09T00:00:00.000Z", updatedAt: "2026-06-09T00:00:00.000Z" },
+      { id: "project:active", name: "Active", ownerId: "user:1", createdAt: "2026-06-09T00:00:00.000Z", updatedAt: "2026-06-09T00:01:00.000Z" },
+    ],
+    canvases: [
+      { id: "canvas:old", projectId: "project:old", name: "Old Canvas", snapshot: { nodes: [], edges: [], viewport: { x: 0, y: 0, zoom: 1 } }, createdAt: "2026-06-09T00:00:00.000Z", updatedAt: "2026-06-09T00:02:00.000Z" },
+      { id: "canvas:active", projectId: "project:active", name: "Active Canvas", snapshot: { nodes: [], edges: [], viewport: { x: 0, y: 0, zoom: 1 } }, createdAt: "2026-06-09T00:00:00.000Z", updatedAt: "2026-06-09T00:10:00.000Z" },
+    ],
+    assets: [
+      { id: "asset:old", projectId: "project:old", type: "image", url: "https://example.test/old.png", mimeType: "image/png", size: 12, source: "upload", createdBy: "user:1", createdAt: "2026-06-09T00:03:00.000Z" },
+    ],
+    workflowUpdates: [],
+    workflowSnapshots: [],
+  };
+
+  assert.deepEqual(buildProjectList(db).map((project) => project.id), ["project:active", "project:old"]);
+});
+
 test("project bundle validation rejects incompatible imports", () => {
   assert.equal(validateProjectBundle(null).ok, false);
   assert.equal(validateProjectBundle({ version: 2, project: {}, canvases: [] }).ok, false);

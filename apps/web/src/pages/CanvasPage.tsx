@@ -13,6 +13,8 @@ import {
   useEdgesState,
   useNodesState,
   type Connection,
+  type FinalConnectionState,
+  type OnConnectStartParams,
   type OnSelectionChangeParams,
 } from "@xyflow/react";
 import { compactYjsDocument, copyCanvas, copyProject, createAsset, createCanvas, createProject, createTask, createUser, deleteAsset, deleteCanvas, deleteProject, ensureProject, exportProject, getCanvas, getProject, getTask, getYjsHistorySnapshot, importProject, listAssets, listModels, listProjects, listUsers, listYjsHistory, saveSnapshot, saveSnapshotJson, updateAsset, updateCanvas, updateProject } from "../api";
@@ -49,8 +51,15 @@ import {
   Y_CANVAS_REMOTE_ORIGIN,
 } from "../yCanvasDocument";
 import { CollaborationOverlay, GroupOverlay } from "./canvas/CanvasOverlays";
+import {
+  CONNECTION_PICKER_TEMP_NODE_ID,
+  getConnectionPickerCandidates,
+  type ConnectionDragStart,
+  type ConnectionPickerCandidate,
+} from "./canvas/connectionPicker";
 import { edgeTypes } from "./canvas/WorkflowEdge";
 import { nodeTypes } from "./canvas/WorkflowCard";
+import { getVisibleAssetCount, getVisibleAssets, shouldCommitAssetLoad, type ProjectAssetState } from "./canvas/assetRuntime";
 import { pickPublicParams } from "./canvas/modelParams";
 import type { WorkflowReactEdge, WorkflowReactNode } from "./canvas/workflowTypes";
 import {
@@ -95,6 +104,68 @@ interface PendingSnapshotSave {
   snapshotJson: string;
 }
 
+interface ConnectionPickerState {
+  x: number;
+  y: number;
+  flowX: number;
+  flowY: number;
+  dragStart: ConnectionDragStart;
+  candidates: ConnectionPickerCandidate[];
+}
+
+function getPointerClientPoint(event: MouseEvent | TouchEvent) {
+  if ("changedTouches" in event && event.changedTouches.length > 0) {
+    const touch = event.changedTouches[0];
+    return { x: touch.clientX, y: touch.clientY };
+  }
+  if ("touches" in event && event.touches.length > 0) {
+    const touch = event.touches[0];
+    return { x: touch.clientX, y: touch.clientY };
+  }
+  return { x: (event as MouseEvent).clientX, y: (event as MouseEvent).clientY };
+}
+
+function applyConnectionDefaults(sourceNode?: WorkflowNode | null, targetNode?: WorkflowNode | null): Partial<WorkflowNode> | null {
+  if (
+    targetNode?.type === "image.generate"
+    && sourceNode?.type === "text.input"
+    && !targetNode.data.promptTouched
+    && !String(targetNode.data.prompt || "").trim()
+  ) {
+    return { data: { prompt: String(sourceNode.data.prompt || "") } };
+  }
+  return null;
+}
+
+function mergeWorkflowNodePatch(node: WorkflowNode, patch: Partial<WorkflowNode>): WorkflowNode {
+  return {
+    ...node,
+    ...patch,
+    data: patch.data ? { ...node.data, ...patch.data } : node.data,
+    runtime: patch.runtime ? { ...node.runtime, ...patch.runtime } : node.runtime,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function formatConnectionCandidateMeta(candidate: ConnectionPickerCandidate) {
+  const categoryNames: Record<string, string> = {
+    input: "输入",
+    generate: "生成",
+    utility: "工具",
+    output: "输出",
+  };
+  const mediaNames: Record<string, string> = {
+    text: "文本",
+    image: "图片",
+    audio: "音频",
+    video: "视频",
+  };
+  const direction = candidate.direction === "downstream" ? "下游" : "上游";
+  const category = categoryNames[candidate.category] || candidate.category;
+  const media = candidate.mediaType ? mediaNames[candidate.mediaType] || candidate.mediaType : "";
+  return [direction, category, media].filter(Boolean).join(" · ");
+}
+
 function getTaskDeadlineAt(task: AITask | null | undefined, fallbackStartedAt: number, timeoutMs: number) {
   if (task?.status === "pending" && !task.startedAt) return Number.POSITIVE_INFINITY;
   const taskStartedAt = task?.startedAt || task?.createdAt;
@@ -123,7 +194,7 @@ export function CanvasPage() {
   const [expandedNodeId, setExpandedNodeId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [traceConnection, setTraceConnection] = useState<{ nodeId: string; mode: "inputs" | "outputs" } | null>(null);
-  const [assets, setAssets] = useState<AssetRecord[]>([]);
+  const [assetState, setAssetState] = useState<ProjectAssetState>({ projectId: null, assets: [], loading: false });
   const [assetLibraryOpen, setAssetLibraryOpen] = useState(false);
   const [projectDrawerOpen, setProjectDrawerOpen] = useState(false);
   const [projectBusy, setProjectBusy] = useState(false);
@@ -167,10 +238,14 @@ export function CanvasPage() {
   const [draggingTemplate, setDraggingTemplate] = useState<{
     type: string;
     icon: string;
+    startX: number;
+    startY: number;
     x: number;
     y: number;
+    moved: boolean;
   } | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; flowX: number; flowY: number; nodeId?: string } | null>(null);
+  const [connectionPicker, setConnectionPicker] = useState<ConnectionPickerState | null>(null);
   const isDraggingNodeRef = useRef(false);
   const groupDragRef = useRef<{
     groupId: string;
@@ -178,6 +253,11 @@ export function CanvasPage() {
     startNodePositions: Record<string, { x: number; y: number }>;
   } | null>(null);
   const activeTaskPollsRef = useRef(new Set<string>());
+  const activeProjectIdRef = useRef<string | null>(null);
+  const assetLoadRequestIdRef = useRef(0);
+  const backendRetryTimerRef = useRef(0);
+  const backendLoadInFlightRef = useRef(false);
+  const backendLocalFallbackAppliedRef = useRef(false);
   const applyingRemoteSnapshotRef = useRef(false);
   const snapshotVersionRef = useRef(0);
   const collaborationBroadcastTimerRef = useRef(0);
@@ -203,12 +283,28 @@ export function CanvasPage() {
   const lastYjsUpdateRef = useRef<Uint8Array | null>(null);
   const workflowNodesRef = useRef<WorkflowNode[]>([]);
   const workflowEdgesRef = useRef<WorkflowEdge[]>([]);
+  const connectionDragStartRef = useRef<ConnectionDragStart | null>(null);
+  const connectionSucceededRef = useRef(false);
+  const connectionReleaseHandledRef = useRef(false);
+  const connectionReleaseAbortRef = useRef<AbortController | null>(null);
+  const connectionReleaseFallbackTimerRef = useRef(0);
+  const suppressNextPaneClickUntilRef = useRef(0);
   const groupsRef = useRef<WorkflowGroup[]>([]);
   const expandedNodeIdRef = useRef<string | null>(null);
   const selectedNodeIdRef = useRef<string | null>(null);
   const collaborationUsersRef = useRef<CollaborationUser[]>([]);
 
   const workflowEdges = useMemo(() => fromReactFlowEdges(rfEdges), [rfEdges]);
+  useEffect(() => {
+    activeProjectIdRef.current = project?.id || null;
+  }, [project?.id]);
+  const assets = useMemo(() => getVisibleAssets(project?.id, assetState), [assetState, project?.id]);
+  const visibleAssetCount = useMemo(
+    () => getVisibleAssetCount(project?.id, assetState, project?.assetCount ?? 0),
+    [assetState, project?.assetCount, project?.id],
+  );
+  const visibleAssetCountText = project?.id ? String(visibleAssetCount) : "加载中";
+  const assetLibraryLoading = Boolean(project?.id && assetState.loading && (assetState.projectId !== project.id || assetState.assets.length === 0));
   useEffect(() => {
     workflowNodesRef.current = workflowNodes;
   }, [workflowNodes]);
@@ -271,6 +367,45 @@ export function CanvasPage() {
     setSaveStatus(lastSavedSnapshotJsonRef.current && snapshotJson === lastSavedSnapshotJsonRef.current ? "saved" : "idle");
   }, []);
 
+  const loadProjectAssets = useCallback(async (projectId: string) => {
+    const requestId = ++assetLoadRequestIdRef.current;
+    setAssetState((current) => current.projectId === projectId
+      ? { ...current, loading: true }
+      : { projectId, assets: [], loading: true });
+    const result = await listAssets(projectId);
+    if (!shouldCommitAssetLoad({
+      requestId,
+      latestRequestId: assetLoadRequestIdRef.current,
+      requestedProjectId: projectId,
+      activeProjectId: activeProjectIdRef.current,
+    })) {
+      return null;
+    }
+    setAssetState({ projectId, assets: result.assets, loading: false });
+    return result.assets;
+  }, []);
+
+  const prependAsset = useCallback((asset: AssetRecord) => {
+    if (activeProjectIdRef.current !== asset.projectId) return;
+    setAssetState((current) => current.projectId === asset.projectId
+      ? { ...current, assets: [asset, ...current.assets], loading: false }
+      : current);
+  }, []);
+
+  const patchLoadedAsset = useCallback((asset: AssetRecord) => {
+    if (activeProjectIdRef.current !== asset.projectId) return;
+    setAssetState((current) => current.projectId === asset.projectId
+      ? { ...current, assets: current.assets.map((item) => item.id === asset.id ? asset : item) }
+      : current);
+  }, []);
+
+  const removeLoadedAsset = useCallback((asset: AssetRecord) => {
+    if (activeProjectIdRef.current !== asset.projectId) return;
+    setAssetState((current) => current.projectId === asset.projectId
+      ? { ...current, assets: current.assets.filter((item) => item.id !== asset.id) }
+      : current);
+  }, []);
+
   const filteredAssets = useMemo(
     () => assetFilter === "all" ? assets : assets.filter((asset) => asset.type === assetFilter),
     [assetFilter, assets],
@@ -324,6 +459,9 @@ export function CanvasPage() {
       window.clearTimeout(collaborationBroadcastTimerRef.current);
       window.clearTimeout(saveTimerRef.current);
       window.clearTimeout(yjsBroadcastTimerRef.current);
+      window.clearTimeout(backendRetryTimerRef.current);
+      window.clearTimeout(connectionReleaseFallbackTimerRef.current);
+      connectionReleaseAbortRef.current?.abort();
       pendingSaveRef.current = null;
       yCanvasRef.current?.destroy();
       yCanvasRef.current = null;
@@ -393,11 +531,11 @@ export function CanvasPage() {
       });
       if (task.status === "succeeded" && project) {
         setNotice("图片生成完成，结果已保存到素材库");
-        setAssets((await listAssets(project.id)).assets);
+        await loadProjectAssets(project.id);
       }
       return task;
     },
-    [patchNode, project],
+    [loadProjectAssets, patchNode, project],
   );
 
   const pollTaskUntilSettled = useCallback(
@@ -463,10 +601,10 @@ export function CanvasPage() {
       patchNode(nodeId, { data: { ...(workflowNodes.find((node) => node.id === nodeId)?.data || {}), url, name: file.name } });
       if (project) {
         const created = await createAsset({ projectId: project.id, type, url, mimeType: file.type, size: file.size, source: "upload" });
-        setAssets((current) => [created.asset, ...current]);
+        prependAsset(created.asset);
       }
     },
-    [patchNode, project, workflowNodes],
+    [patchNode, prependAsset, project, workflowNodes],
   );
 
   const saveNodeResultAsAsset = useCallback(async (nodeId: string) => {
@@ -484,10 +622,10 @@ export function CanvasPage() {
       source: "ai-generated",
       createdBy: currentUser?.id,
     });
-    setAssets((current) => [created.asset, ...current]);
+    prependAsset(created.asset);
     setAssetLibraryOpen(true);
     setNotice("节点结果已保存到素材库");
-  }, [currentUser, project, workflowNodes]);
+  }, [currentUser, prependAsset, project, workflowNodes]);
 
   const copyNodeResultUrl = useCallback(async (nodeId: string) => {
     const node = workflowNodes.find((item) => item.id === nodeId);
@@ -522,16 +660,16 @@ export function CanvasPage() {
     const name = window.prompt("请输入素材名称", asset.name || "");
     if (name === null) return;
     const updated = (await updateAsset(asset.id, { name })).asset;
-    setAssets((current) => current.map((item) => item.id === updated.id ? updated : item));
+    patchLoadedAsset(updated);
     if (previewAsset?.id === updated.id) setPreviewAsset(updated);
-  }, [previewAsset]);
+  }, [patchLoadedAsset, previewAsset]);
 
   const removeAsset = useCallback(async (asset: AssetRecord) => {
     if (!window.confirm("确定删除这个素材吗？")) return;
     await deleteAsset(asset.id);
-    setAssets((current) => current.filter((item) => item.id !== asset.id));
+    removeLoadedAsset(asset);
     if (previewAsset?.id === asset.id) setPreviewAsset(null);
-  }, [previewAsset]);
+  }, [previewAsset, removeLoadedAsset]);
 
   const copyAssetUrl = useCallback(async (asset: AssetRecord) => {
     await navigator.clipboard.writeText(asset.url);
@@ -653,42 +791,62 @@ export function CanvasPage() {
     applySnapshotFromYCanvas(snapshot, { resetSelection: true });
   }, [applySnapshotFromYCanvas]);
 
-  useEffect(() => {
-    Promise.all([listUsers(), listModels()])
-      .then(async ([userResult, modelResult]) => {
-        let loadedUsers = userResult.users;
-        if (!loadedUsers.length) {
-          const created = await createUser("默认用户");
-          loadedUsers = [created.user];
-        }
-        const savedUserId = localStorage.getItem("anime-canvas-active-user-id");
-        const activeUser = loadedUsers.find((user) => user.id === savedUserId) || loadedUsers[0];
-        localStorage.setItem("anime-canvas-active-user-id", activeUser.id);
-        localUserRef.current = { ...localUserRef.current, id: activeUser.id, name: activeUser.name };
-        setUsers(loadedUsers);
-        setCurrentUser(activeUser);
-        setModels(modelResult.models);
+  const loadBackendState = useCallback(async (isRetry = false) => {
+    if (backendLoadInFlightRef.current) return;
+    backendLoadInFlightRef.current = true;
+    try {
+      const [userResult, modelResult] = await Promise.all([listUsers(), listModels()]);
+      let loadedUsers = userResult.users;
+      if (!loadedUsers.length) {
+        const created = await createUser("默认用户");
+        loadedUsers = [created.user];
+      }
+      const savedUserId = localStorage.getItem("anime-canvas-active-user-id");
+      const activeUser = loadedUsers.find((user) => user.id === savedUserId) || loadedUsers[0];
+      localStorage.setItem("anime-canvas-active-user-id", activeUser.id);
+      localUserRef.current = { ...localUserRef.current, id: activeUser.id, name: activeUser.name };
+      setUsers(loadedUsers);
+      setCurrentUser(activeUser);
+      setModels(modelResult.models);
 
-        const { project: loadedProject, canvases: loadedCanvases } = await ensureProject(activeUser.id);
-        const loadedProjects = (await listProjects()).projects;
-        setProjects(loadedProjects);
-        setProject(loadedProject);
-        setCanvases(loadedCanvases);
-        const savedCanvasId = localStorage.getItem("anime-canvas-canvas-id");
-        const selectedCanvas = loadedCanvases.find((item) => item.id === savedCanvasId) || loadedCanvases[0];
-        await loadCanvasRecord(selectedCanvas.id, true);
-        setAssets((await listAssets(loadedProject.id)).assets);
-        setNotice("画布已连接后端并加载完成");
-      })
-      .catch(() => {
+      const { project: loadedProject, canvases: loadedCanvases } = await ensureProject(activeUser.id);
+      const loadedProjects = (await listProjects()).projects;
+      const projectSummary = loadedProjects.find((item) => item.id === loadedProject.id);
+      const nextProject = projectSummary ? { ...loadedProject, ...projectSummary } : loadedProject;
+      setProjects(loadedProjects);
+      setProject(nextProject);
+      activeProjectIdRef.current = nextProject.id;
+      localStorage.setItem("anime-canvas-project-id", nextProject.id);
+      setCanvases(loadedCanvases);
+      const savedCanvasId = localStorage.getItem("anime-canvas-canvas-id");
+      const selectedCanvas = loadedCanvases.find((item) => item.id === savedCanvasId) || loadedCanvases[0];
+      await loadCanvasRecord(selectedCanvas.id, true);
+      await loadProjectAssets(nextProject.id);
+      backendLocalFallbackAppliedRef.current = false;
+      window.clearTimeout(backendRetryTimerRef.current);
+      backendRetryTimerRef.current = 0;
+      setNotice(isRetry ? "后端已恢复连接并加载完成" : "画布已连接后端并加载完成");
+    } catch {
+      if (!backendLocalFallbackAppliedRef.current) {
         const snapshot = readLocalSnapshot();
         const yCanvas = yCanvasRef.current;
         if (yCanvas) applySnapshotToYDoc(yCanvas, snapshot, Y_CANVAS_LOAD_ORIGIN);
         applySnapshotFromYCanvas(snapshot, { resetSelection: true });
-        setNotice("后端不可用，已进入浏览器本地模式");
-      });
-  }, [applySnapshotFromYCanvas, loadCanvasRecord]);
+        backendLocalFallbackAppliedRef.current = true;
+      }
+      setNotice("后端不可用，已进入浏览器本地模式；将自动重试连接");
+      window.clearTimeout(backendRetryTimerRef.current);
+      backendRetryTimerRef.current = window.setTimeout(() => {
+        loadBackendState(true).catch(() => {});
+      }, 4000);
+    } finally {
+      backendLoadInFlightRef.current = false;
+    }
+  }, [applySnapshotFromYCanvas, loadCanvasRecord, loadProjectAssets]);
 
+  useEffect(() => {
+    loadBackendState().catch(() => {});
+  }, [loadBackendState]);
   useEffect(() => {
     if (!canvas || !currentUser) return;
     collaborationClientRef.current?.close();
@@ -971,35 +1129,25 @@ export function CanvasPage() {
     setExpandedNodeId(next.id);
   };
 
-  const onConnect = (connection: Connection) => {
+  const commitWorkflowConnection = useCallback((connection: Connection, nodesForValidation = workflowNodes, edgesForValidation = workflowEdges) => {
     const normalizedConnection = {
       ...connection,
       sourceHandle: normalizePortId(String(connection.sourceHandle || "")),
       targetHandle: normalizePortId(String(connection.targetHandle || "")),
     };
-    const validation = validateConnection(workflowNodes, workflowEdges, normalizedConnection);
+    const validation = validateConnection(nodesForValidation, edgesForValidation, normalizedConnection);
     if (!validation.valid) {
       setNotice(validation.message || "连接不合法");
-      return;
-    }
-    const targetNode = workflowNodeById.get(String(normalizedConnection.target || ""));
-    const sourceNode = workflowNodeById.get(String(normalizedConnection.source || ""));
-    if (
-      targetNode?.type === "image.generate"
-      && sourceNode?.type === "text.input"
-      && !targetNode.data.promptTouched
-      && !String(targetNode.data.prompt || "").trim()
-    ) {
-      patchNode(targetNode.id, { data: { ...targetNode.data, prompt: String(sourceNode.data.prompt || "") } });
+      return null;
     }
 
     const edgeId = createId("edge");
     const workflowEdge: WorkflowEdge = {
       id: edgeId,
-      sourceNodeId: String(connection.source || ""),
-      sourcePortId: normalizePortId(String(connection.sourceHandle || "")),
-      targetNodeId: String(connection.target || ""),
-      targetPortId: normalizePortId(String(connection.targetHandle || "")),
+      sourceNodeId: String(normalizedConnection.source || ""),
+      sourcePortId: String(normalizedConnection.sourceHandle || ""),
+      targetNodeId: String(normalizedConnection.target || ""),
+      targetPortId: String(normalizedConnection.targetHandle || ""),
     };
     const yCanvas = yCanvasRef.current;
     if (yCanvas) upsertYCanvasEdge(yCanvas, workflowEdge, Y_CANVAS_LOCAL_ORIGIN);
@@ -1009,15 +1157,154 @@ export function CanvasPage() {
         {
           ...connection,
           id: edgeId,
-          sourceHandle: connection.sourceHandle,
-          targetHandle: connection.targetHandle,
+          sourceHandle: normalizedConnection.sourceHandle,
+          targetHandle: normalizedConnection.targetHandle,
           animated: true,
         },
         current,
       ),
     );
+    return workflowEdge;
+  }, [setRfEdges, workflowEdges, workflowNodes]);
+
+  const cancelConnectionReleaseFallback = useCallback(() => {
+    window.clearTimeout(connectionReleaseFallbackTimerRef.current);
+    connectionReleaseFallbackTimerRef.current = 0;
+    connectionReleaseAbortRef.current?.abort();
+    connectionReleaseAbortRef.current = null;
+  }, []);
+
+  const openConnectionPickerFromPoint = useCallback((dragStart: ConnectionDragStart, point: { x: number; y: number }) => {
+    const canvasRect = containerRef.current?.getBoundingClientRect();
+    const isInsideCanvas = Boolean(
+      canvasRect
+        && point.x >= canvasRect.left
+        && point.x <= canvasRect.right
+        && point.y >= canvasRect.top
+        && point.y <= canvasRect.bottom,
+    );
+    if (!isInsideCanvas) return false;
+
+    const candidates = getConnectionPickerCandidates(workflowNodesRef.current, workflowEdgesRef.current, dragStart);
+    const flow = screenToFlowPosition(point);
+    const pickerWidth = 292;
+    const pickerHeight = Math.min(360, 72 + Math.max(1, candidates.length) * 54);
+    const x = Math.min(Math.max(point.x + 10, 12), window.innerWidth - pickerWidth - 12);
+    const y = Math.min(Math.max(point.y + 10, 68), window.innerHeight - pickerHeight - 44);
+    suppressNextPaneClickUntilRef.current = Date.now() + 300;
+    setContextMenu(null);
+    setConnectionPicker({ x, y, flowX: flow.x, flowY: flow.y, dragStart, candidates });
+    if (candidates.length === 0) setNotice("当前端口没有可补充的兼容节点");
+    return true;
+  }, [screenToFlowPosition]);
+
+  const finishConnectionRelease = useCallback((dragStart: ConnectionDragStart, point: { x: number; y: number }) => {
+    if (connectionReleaseHandledRef.current || connectionSucceededRef.current) return false;
+    connectionReleaseHandledRef.current = true;
+    connectionDragStartRef.current = null;
+    cancelConnectionReleaseFallback();
+    return openConnectionPickerFromPoint(dragStart, point);
+  }, [cancelConnectionReleaseFallback, openConnectionPickerFromPoint]);
+
+  const onConnect = (connection: Connection) => {
+    connectionSucceededRef.current = true;
+    connectionReleaseHandledRef.current = true;
+    connectionDragStartRef.current = null;
+    cancelConnectionReleaseFallback();
+    setConnectionPicker(null);
+    const committedEdge = commitWorkflowConnection(connection);
+    if (!committedEdge) return;
+    const targetNode = workflowNodeById.get(String(connection.target || ""));
+    const sourceNode = workflowNodeById.get(String(connection.source || ""));
+    const targetPatch = applyConnectionDefaults(sourceNode, targetNode);
+    if (targetPatch && targetNode) patchNode(targetNode.id, targetPatch);
     setNotice("连接成功");
   };
+
+  const onConnectStart = (_event: MouseEvent | TouchEvent, params: OnConnectStartParams) => {
+    connectionSucceededRef.current = false;
+    connectionReleaseHandledRef.current = false;
+    cancelConnectionReleaseFallback();
+    setConnectionPicker(null);
+    if (!params.nodeId || !params.handleId || (params.handleType !== "source" && params.handleType !== "target")) {
+      connectionDragStartRef.current = null;
+      return;
+    }
+    const dragStart: ConnectionDragStart = {
+      nodeId: params.nodeId,
+      handleId: normalizePortId(params.handleId),
+      handleType: params.handleType,
+    };
+    connectionDragStartRef.current = dragStart;
+    const controller = new AbortController();
+    connectionReleaseAbortRef.current = controller;
+    const onWindowRelease = (releaseEvent: PointerEvent | MouseEvent | TouchEvent) => {
+      const activeDragStart = connectionDragStartRef.current;
+      if (!activeDragStart || connectionSucceededRef.current) return;
+      const point = getPointerClientPoint(releaseEvent as MouseEvent | TouchEvent);
+      connectionReleaseFallbackTimerRef.current = window.setTimeout(() => {
+        finishConnectionRelease(activeDragStart, point);
+      }, 0);
+    };
+    window.addEventListener("pointerup", onWindowRelease, { capture: true, once: true, signal: controller.signal });
+    window.addEventListener("mouseup", onWindowRelease, { capture: true, once: true, signal: controller.signal });
+    window.addEventListener("touchend", onWindowRelease, { capture: true, once: true, signal: controller.signal });
+  };
+
+  const onConnectEnd = (event: MouseEvent | TouchEvent, connectionState: FinalConnectionState) => {
+    const dragStart = connectionDragStartRef.current;
+    if (!dragStart || connectionSucceededRef.current || connectionState.toHandle) {
+      connectionDragStartRef.current = null;
+      cancelConnectionReleaseFallback();
+      return;
+    }
+    finishConnectionRelease(dragStart, getPointerClientPoint(event));
+  };
+  const addNodeFromConnectionPicker = useCallback((candidate: ConnectionPickerCandidate) => {
+    const picker = connectionPicker;
+    if (!picker) return;
+    const offsetX = candidate.direction === "downstream" ? 90 : -376;
+    const nextNode = makeWorkflowNode(candidate.nodeType, {
+      x: picker.flowX + offsetX,
+      y: picker.flowY - 124,
+    });
+    const sourceNodeId = candidate.sourceNodeId === CONNECTION_PICKER_TEMP_NODE_ID ? nextNode.id : candidate.sourceNodeId;
+    const targetNodeId = candidate.targetNodeId === CONNECTION_PICKER_TEMP_NODE_ID ? nextNode.id : candidate.targetNodeId;
+    const connection: Connection = {
+      source: sourceNodeId,
+      sourceHandle: candidate.sourcePortId,
+      target: targetNodeId,
+      targetHandle: candidate.targetPortId,
+    };
+    const nodesForValidation = [...workflowNodesRef.current, nextNode];
+    const edgesForValidation = workflowEdgesRef.current;
+    const validation = validateConnection(nodesForValidation, edgesForValidation, connection);
+    if (!validation.valid) {
+      setNotice(validation.message || "连接不合法");
+      setConnectionPicker(null);
+      return;
+    }
+
+    const sourceNode = nodesForValidation.find((node) => node.id === sourceNodeId);
+    const targetNode = nodesForValidation.find((node) => node.id === targetNodeId);
+    const targetPatch = applyConnectionDefaults(sourceNode, targetNode);
+    const committedNode = targetPatch && targetNode?.id === nextNode.id
+      ? mergeWorkflowNodePatch(nextNode, targetPatch)
+      : nextNode;
+    const yCanvas = yCanvasRef.current;
+    if (yCanvas) upsertYCanvasNode(yCanvas, committedNode, Y_CANVAS_LOCAL_ORIGIN);
+    setWorkflowNodes((current) => [...current, committedNode]);
+    if (targetPatch && targetNode && targetNode.id !== nextNode.id) patchNode(targetNode.id, targetPatch);
+
+    const committedEdge = commitWorkflowConnection(connection, [...workflowNodesRef.current, committedNode], edgesForValidation);
+    setConnectionPicker(null);
+    if (!committedEdge) return;
+    setSelectedNodeId(committedNode.id);
+    setExpandedNodeId(committedNode.id);
+    setSelectedEdgeId(null);
+    setTraceConnection(null);
+    setNotice(`已创建「${candidate.name}」并完成连接`);
+  }, [commitWorkflowConnection, connectionPicker, patchNode]);
 
   const deleteSelected = useCallback(() => {
     if (selectedEdgeId) {
@@ -1207,11 +1494,13 @@ export function CanvasPage() {
     const loaded = await getProject(projectId);
     localStorage.setItem("anime-canvas-project-id", loaded.project.id);
     const projectSummary = projectSummaries.find((item) => item.id === loaded.project.id);
-    setProject(projectSummary ? { ...loaded.project, ...projectSummary } : loaded.project);
+    const nextProject = projectSummary ? { ...loaded.project, ...projectSummary } : loaded.project;
+    setProject(nextProject);
+    activeProjectIdRef.current = nextProject.id;
     setCanvases(loaded.canvases);
     const selectedCanvas = loaded.canvases.find((item) => item.id === preferredCanvasId) || loaded.canvases[0];
     if (selectedCanvas) await loadCanvasRecord(selectedCanvas.id);
-    setAssets((await listAssets(loaded.project.id)).assets);
+    await loadProjectAssets(loaded.project.id);
     setYjsHistory([]);
     setSelectedYjsHistoryDetail(null);
     setHistoryError(null);
@@ -1523,6 +1812,7 @@ export function CanvasPage() {
       }
       if (event.key === "Escape") {
         setContextMenu(null);
+        setConnectionPicker(null);
         setNodeLibraryOpen(false);
         setAssetLibraryOpen(false);
         setPreviewAsset(null);
@@ -1551,10 +1841,18 @@ export function CanvasPage() {
     if (!draggingTemplate) return;
 
     const onPointerMove = (event: PointerEvent) => {
-      setDraggingTemplate((current) => current ? { ...current, x: event.clientX, y: event.clientY } : current);
+      setDraggingTemplate((current) => {
+        if (!current) return current;
+        const moved = current.moved || Math.hypot(event.clientX - current.startX, event.clientY - current.startY) > 6;
+        return { ...current, x: event.clientX, y: event.clientY, moved };
+      });
     };
 
     const onPointerUp = (event: PointerEvent) => {
+      if (!draggingTemplate.moved) {
+        setDraggingTemplate(null);
+        return;
+      }
       const canvasElement = document.querySelector(".canvas-panel");
       const canvasRect = canvasElement?.getBoundingClientRect();
       const isInsideCanvas = Boolean(
@@ -2031,8 +2329,11 @@ export function CanvasPage() {
                   setDraggingTemplate({
                     type: definition.type,
                     icon: getNodeIcon(definition.type),
+                    startX: event.clientX,
+                    startY: event.clientY,
                     x: event.clientX,
                     y: event.clientY,
+                    moved: false,
                   });
                   setNotice(`拖动「${definition.name}」到画布后松开放置`);
                 }}
@@ -2078,7 +2379,7 @@ export function CanvasPage() {
           <header>
             <div>
               <strong>素材库</strong>
-              <span>{assets.length} 个素材</span>
+              <span>{visibleAssetCountText} 个素材</span>
             </div>
             <button type="button" onClick={() => setAssetLibraryOpen(false)}>×</button>
           </header>
@@ -2090,7 +2391,8 @@ export function CanvasPage() {
             ))}
           </div>
           <div className="asset-grid">
-            {filteredAssets.length === 0 && <div className="asset-empty">暂无素材，生成或上传后会出现在这里</div>}
+            {assetLibraryLoading && <div className="asset-empty">正在加载素材…</div>}
+            {!assetLibraryLoading && filteredAssets.length === 0 && <div className="asset-empty">暂无素材，生成或上传后会出现在这里</div>}
             {filteredAssets.map((asset) => (
               <article
                 key={asset.id}
@@ -2163,6 +2465,32 @@ export function CanvasPage() {
         </div>
       )}
 
+      {connectionPicker && (
+        <div className="connection-node-picker nodrag" style={{ left: connectionPicker.x, top: connectionPicker.y }}>
+          <div className="connection-node-picker-head">
+            <span>{connectionPicker.dragStart.handleType === "source" ? "选择下游节点" : "选择上游节点"}</span>
+            <button type="button" title="关闭" onClick={() => setConnectionPicker(null)}>×</button>
+          </div>
+          <div className="connection-node-picker-list">
+            {connectionPicker.candidates.length > 0 ? connectionPicker.candidates.map((candidate) => (
+              <button
+                key={`${candidate.direction}:${candidate.nodeType}:${candidate.sourcePortId}:${candidate.targetPortId}`}
+                type="button"
+                onClick={() => addNodeFromConnectionPicker(candidate)}
+              >
+                <span className="connection-node-picker-icon">{getNodeIcon(candidate.nodeType)}</span>
+                <span>
+                  <strong>{candidate.name}</strong>
+                  <em>{formatConnectionCandidateMeta(candidate)}</em>
+                </span>
+              </button>
+            )) : (
+              <div className="connection-node-picker-empty">没有兼容节点</div>
+            )}
+          </div>
+        </div>
+      )}
+
       <main
         ref={containerRef}
         className={`canvas-panel ${draggingTemplate ? "placing-node" : ""}`}
@@ -2186,6 +2514,7 @@ export function CanvasPage() {
             setNotice("已取消放置节点");
             return;
           }
+          setConnectionPicker(null);
           const flow = screenToFlowPosition({ x: event.clientX, y: event.clientY });
           setContextMenu({ x: event.clientX, y: event.clientY, flowX: flow.x, flowY: flow.y, nodeId: selectedNodeId || undefined });
         }}
@@ -2198,6 +2527,8 @@ export function CanvasPage() {
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
+          onConnectStart={onConnectStart}
+          onConnectEnd={onConnectEnd}
           onNodeDragStart={() => {
             const baselineBundle = getSnapshotBundle();
             dragHistoryBaselineRef.current = baselineBundle.snapshot;
@@ -2259,6 +2590,8 @@ export function CanvasPage() {
           }}
           onPaneClick={() => {
             setContextMenu(null);
+            if (Date.now() < suppressNextPaneClickUntilRef.current) return;
+            setConnectionPicker(null);
             setSelectedNodeId(null);
             setExpandedNodeId(null);
             setSelectedEdgeId(null);
@@ -2298,7 +2631,7 @@ export function CanvasPage() {
         <span>{notice}</span>
         <span className="statusbar-right">
           <span className="zoom-indicator">{Math.round(zoom / (2 / 3) * 100)}%</span>
-          <span>节点 {workflowNodes.length} · 连线 {workflowEdges.length} · 素材 {assets.length}</span>
+          <span>节点 {workflowNodes.length} · 连线 {workflowEdges.length} · 素材 {visibleAssetCountText}</span>
         </span>
       </footer>
     </div>

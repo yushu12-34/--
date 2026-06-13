@@ -1,10 +1,11 @@
-import { mkdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { now } from "./utils/http.js";
 
 const DATA_DIR = process.env.DATA_DIR || path.resolve("data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
+const BACKUP_DIR = path.join(DATA_DIR, "backups");
 
 export const emptySnapshot = {
   nodes: [],
@@ -359,9 +360,103 @@ function completeHttpAdapterConfig(model) {
   return changed;
 }
 
+function isDbObject(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+async function tryReadDbFile(file) {
+  try {
+    const data = JSON.parse(await readFile(file, "utf8"));
+    if (!isDbObject(data)) return null;
+    const fileStat = await stat(file);
+    return { file, data, mtimeMs: fileStat.mtimeMs, size: fileStat.size };
+  } catch {
+    return null;
+  }
+}
+
+async function tryRecoverTruncatedDbFile() {
+  try {
+    const raw = await readFile(DB_FILE, "utf8");
+    for (let i = raw.length - 1; i > 0; i--) {
+      if (raw[i] !== "}") continue;
+      try {
+        const data = JSON.parse(raw.slice(0, i + 1));
+        if (!isDbObject(data)) continue;
+        const tmpFile = `${DB_FILE}.recover-${process.pid}-${Date.now()}.tmp`;
+        await writeFile(tmpFile, raw.slice(0, i + 1), "utf8");
+        await rename(tmpFile, DB_FILE);
+        return data;
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
+async function listRecoveryCandidateFiles() {
+  const files = [];
+  try {
+    for (const name of await readdir(DATA_DIR)) {
+      if (name === "db.json.tmp" || /^db\.json\..+\.tmp$/.test(name)) files.push(path.join(DATA_DIR, name));
+    }
+  } catch {}
+  try {
+    for (const name of await readdir(BACKUP_DIR)) {
+      if (name.endsWith(".json")) files.push(path.join(BACKUP_DIR, name));
+    }
+  } catch {}
+  return files;
+}
+
+async function recoverDbFromCandidates() {
+  const candidates = [];
+  for (const file of await listRecoveryCandidateFiles()) {
+    const candidate = await tryReadDbFile(file);
+    if (candidate) candidates.push(candidate);
+  }
+  candidates.sort((left, right) => right.mtimeMs - left.mtimeMs || right.size - left.size);
+  const candidate = candidates[0];
+  if (!candidate) return null;
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const corruptBackup = `${DB_FILE}.corrupt-${timestamp}.bak`;
+  await rename(DB_FILE, corruptBackup).catch(() => {});
+  const recoveryTmp = `${DB_FILE}.recovered-${process.pid}-${Date.now()}.tmp`;
+  await copyFile(candidate.file, recoveryTmp);
+  await rename(recoveryTmp, DB_FILE);
+  console.warn(`Recovered db.json from ${candidate.file}; corrupt file preserved as ${corruptBackup}`);
+  return candidate.data;
+}
+
+async function readDbWithRecovery() {
+  const parsed = await tryReadDbFile(DB_FILE);
+  if (parsed) return parsed.data;
+  const truncated = await tryRecoverTruncatedDbFile();
+  if (truncated) return truncated;
+  const recovered = await recoverDbFromCandidates();
+  if (recovered) return recovered;
+  throw new Error("鏁版嵁搴撴枃浠舵崯鍧忎笖鏃犳硶鎭㈠");
+}
+
+async function renameWithRetry(source, target) {
+  let lastError;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await rename(source, target);
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
+    }
+  }
+  throw lastError;
+}
+
 export async function ensureDb() {
   await mkdir(DATA_DIR, { recursive: true });
   if (!existsSync(DB_FILE)) {
+    const recovered = await recoverDbFromCandidates();
+    if (recovered) return;
     const timestamp = now();
     await writeJson({
       users: [defaultUser(timestamp)],
@@ -378,24 +473,7 @@ export async function ensureDb() {
     return;
   }
 
-  let db;
-  try {
-    db = JSON.parse(await readFile(DB_FILE, "utf8"));
-  } catch {
-    const raw = await readFile(DB_FILE, "utf8");
-    db = null;
-    for (let i = raw.length - 1; i > 0; i--) {
-      if (raw[i] === "}") {
-        try {
-          db = JSON.parse(raw.slice(0, i + 1));
-          await writeFile(DB_FILE + ".tmp", raw.slice(0, i + 1), "utf8");
-          await rename(DB_FILE + ".tmp", DB_FILE);
-          break;
-        } catch {}
-      }
-    }
-    if (!db) throw new Error("数据库文件损坏且无法恢复");
-  }
+  const db = await readDbWithRecovery();
   const timestamp = now();
   let changed = false;
   if (!db.users) { db.users = [defaultUser(timestamp)]; changed = true; }
@@ -484,22 +562,8 @@ export async function readJson(shouldEnsure = true) {
   if (shouldEnsure) await ensureDb();
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      return JSON.parse(await readFile(DB_FILE, "utf8"));
-    } catch {
-      try {
-        const raw = await readFile(DB_FILE, "utf8");
-        for (let i = raw.length - 1; i > 0; i--) {
-          if (raw[i] === "}") {
-            try {
-              const data = JSON.parse(raw.slice(0, i + 1));
-              await writeFile(DB_FILE + ".tmp", raw.slice(0, i + 1), "utf8");
-              await rename(DB_FILE + ".tmp", DB_FILE);
-              return data;
-            } catch {}
-          }
-        }
-      } catch {}
-    }
+      return await readDbWithRecovery();
+    } catch {}
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error("数据库读取失败，请重试");
@@ -512,11 +576,12 @@ async function writeJsonFile(data) {
   const tmpFile = `${DB_FILE}.${process.pid}.${Date.now()}.tmp`;
   try {
     await writeFile(tmpFile, content, "utf8");
-    await rename(tmpFile, DB_FILE);
-  } catch {
-    // Windows: rename fails if target is locked; fall back to direct write
-    await unlink(tmpFile).catch(() => {});
-    await writeFile(DB_FILE, content, "utf8");
+    JSON.parse(await readFile(tmpFile, "utf8"));
+    await renameWithRetry(tmpFile, DB_FILE);
+  } catch (error) {
+    const validTmp = await tryReadDbFile(tmpFile);
+    if (!validTmp) await unlink(tmpFile).catch(() => {});
+    throw error;
   }
 }
 

@@ -51,7 +51,7 @@ export function buildProjectList(db) {
         .sort()
         .at(-1),
     };
-  });
+  }).sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime());
 }
 
 export function validateProjectBundle(bundle) {
