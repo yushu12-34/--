@@ -2,10 +2,12 @@ import { copyFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } f
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { now } from "./utils/http.js";
+import { createPostgresStore } from "./services/postgresStore.js";
 
 const DATA_DIR = process.env.DATA_DIR || path.resolve("data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 const BACKUP_DIR = path.join(DATA_DIR, "backups");
+const DATA_BACKEND = String(process.env.DATA_BACKEND || "json").toLowerCase();
 
 export const emptySnapshot = {
   nodes: [],
@@ -452,40 +454,38 @@ async function renameWithRetry(source, target) {
   throw lastError;
 }
 
-export async function ensureDb() {
-  await mkdir(DATA_DIR, { recursive: true });
-  if (!existsSync(DB_FILE)) {
-    const recovered = await recoverDbFromCandidates();
-    if (recovered) return;
-    const timestamp = now();
-    await writeJson({
-      users: [defaultUser(timestamp)],
-      projects: [],
-      canvases: [],
-      assets: [],
-      tasks: [],
-      systemEvents: [],
-      workflowUpdates: [],
-      workflowSnapshots: [],
-      providers: [defaultProvider(timestamp), defaultZImageProvider(timestamp)],
-      models: [defaultModel(timestamp), defaultZImageModel(timestamp)],
-    });
-    return;
-  }
+export function createDefaultDb(timestamp = now()) {
+  return {
+    users: [defaultUser(timestamp)],
+    userDevices: [],
+    projectMembers: [],
+    projects: [],
+    canvases: [],
+    assets: [],
+    tasks: [],
+    systemEvents: [],
+    workflowUpdates: [],
+    workflowSnapshots: [],
+    providers: [defaultProvider(timestamp), defaultZImageProvider(timestamp)],
+    models: [defaultModel(timestamp), defaultZImageModel(timestamp)],
+  };
+}
 
-  const db = await readDbWithRecovery();
-  const timestamp = now();
+export function normalizeDb(db, timestamp = now()) {
+  if (!isDbObject(db)) db = createDefaultDb(timestamp);
   let changed = false;
-  if (!db.users) { db.users = [defaultUser(timestamp)]; changed = true; }
-  if (!db.providers) { db.providers = []; changed = true; }
-  if (!db.models) { db.models = []; changed = true; }
-  if (!db.projects) { db.projects = []; changed = true; }
-  if (!db.canvases) { db.canvases = []; changed = true; }
-  if (!db.assets) { db.assets = []; changed = true; }
-  if (!db.tasks) { db.tasks = []; changed = true; }
-  if (!db.systemEvents) { db.systemEvents = []; changed = true; }
-  if (!db.workflowUpdates) { db.workflowUpdates = []; changed = true; }
-  if (!db.workflowSnapshots) { db.workflowSnapshots = []; changed = true; }
+  if (!Array.isArray(db.users) || db.users.length === 0) { db.users = [defaultUser(timestamp)]; changed = true; }
+  if (!Array.isArray(db.userDevices)) { db.userDevices = []; changed = true; }
+  if (!Array.isArray(db.projectMembers)) { db.projectMembers = []; changed = true; }
+  if (!Array.isArray(db.providers)) { db.providers = []; changed = true; }
+  if (!Array.isArray(db.models)) { db.models = []; changed = true; }
+  if (!Array.isArray(db.projects)) { db.projects = []; changed = true; }
+  if (!Array.isArray(db.canvases)) { db.canvases = []; changed = true; }
+  if (!Array.isArray(db.assets)) { db.assets = []; changed = true; }
+  if (!Array.isArray(db.tasks)) { db.tasks = []; changed = true; }
+  if (!Array.isArray(db.systemEvents)) { db.systemEvents = []; changed = true; }
+  if (!Array.isArray(db.workflowUpdates)) { db.workflowUpdates = []; changed = true; }
+  if (!Array.isArray(db.workflowSnapshots)) { db.workflowSnapshots = []; changed = true; }
 
   for (const provider of db.providers) {
     if (provider.encryptedSecret && !provider.secretValue) {
@@ -555,10 +555,47 @@ export async function ensureDb() {
     }
   }
 
-  if (changed) await writeJson(db);
+  return { db, changed };
+}
+
+let postgresStore;
+
+function isPostgresBackend() {
+  return DATA_BACKEND === "postgres" || DATA_BACKEND === "postgresql";
+}
+
+function getPostgresStore() {
+  if (!postgresStore) postgresStore = createPostgresStore({ createDefaultDb, normalizeDb });
+  return postgresStore;
+}
+
+async function ensureJsonDb() {
+  await mkdir(DATA_DIR, { recursive: true });
+  if (!existsSync(DB_FILE)) {
+    const recovered = await recoverDbFromCandidates();
+    if (recovered) {
+      const normalized = normalizeDb(recovered);
+      if (normalized.changed) await writeJsonFile(normalized.db);
+      return;
+    }
+    await writeJsonFile(createDefaultDb());
+    return;
+  }
+
+  const normalized = normalizeDb(await readDbWithRecovery());
+  if (normalized.changed) await writeJsonFile(normalized.db);
+}
+
+export async function ensureDb() {
+  if (isPostgresBackend()) return getPostgresStore().ensureDb();
+  return ensureJsonDb();
 }
 
 export async function readJson(shouldEnsure = true) {
+  if (isPostgresBackend()) {
+    if (shouldEnsure) await ensureDb();
+    return getPostgresStore().readJson();
+  }
   if (shouldEnsure) await ensureDb();
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -586,6 +623,12 @@ async function writeJsonFile(data) {
 }
 
 export async function writeJson(data) {
+  if (isPostgresBackend()) {
+    const next = dbQueue.then(() => getPostgresStore().writeJson(data));
+    dbQueue = next.catch(() => {});
+    await next;
+    return;
+  }
   const next = dbQueue.then(() => writeJsonFile(data));
   dbQueue = next.catch(() => {});
   await next;
@@ -597,6 +640,11 @@ export async function readJsonQueued() {
 }
 
 export async function updateJson(mutator) {
+  if (isPostgresBackend()) {
+    const next = dbQueue.then(() => getPostgresStore().updateJson(mutator));
+    dbQueue = next.then(() => undefined, () => undefined);
+    return next;
+  }
   const next = dbQueue.then(async () => {
     const db = await readJson(false);
     const result = await mutator(db);

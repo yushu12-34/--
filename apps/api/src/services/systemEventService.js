@@ -30,7 +30,7 @@ function sanitizeMetadataValue(value, depth = 0) {
 }
 
 function normalizeLevel(level) {
-  return ["info", "warning", "error"].includes(level) ? level : "info";
+  return ["info", "warn", "warning", "error"].includes(level) ? level : "info";
 }
 
 function normalizeCategory(category) {

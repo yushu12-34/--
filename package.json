@@ -16,7 +16,11 @@
     "security:release": "powershell -ExecutionPolicy Bypass -File scripts/security-preflight.ps1 -RequireInternalToken",
     "smoke:release": "powershell -ExecutionPolicy Bypass -File scripts/release-smoke.ps1",
     "recovery:drill": "powershell -ExecutionPolicy Bypass -File scripts/recovery-drill.ps1",
+    "postgres:dry-run": "node scripts/postgres-dry-run.mjs",
+    "postgres:smoke": "node scripts/postgres-smoke.mjs",
+    "postgres:migrate": "node scripts/postgres-migrate.mjs",
+    "postgres:api-smoke": "node scripts/postgres-api-smoke.mjs",
     "preflight": "powershell -ExecutionPolicy Bypass -File scripts/preflight-local.ps1",
-    "check": "node --check apps/api/src/server.js && node --check apps/api/src/db.js && node --check apps/api/src/services/taskService.js && node --check apps/api/src/services/queueService.js && node --check apps/api/src/services/storageService.js && node --check apps/api/src/services/collaborationService.js && node --check apps/api/src/services/yjsPersistenceService.js && node --check apps/api/src/services/projectArchiveService.js && node --check apps/api/src/services/imageGeneration.js && node --check apps/api/src/services/systemEventService.js && node --check apps/api/src/services/adminOverviewService.js && npm test && npm --prefix apps/web run build && npm --prefix apps/admin run build"
+    "check": "node --check apps/api/src/server.js && node --check apps/api/src/db.js && node --check apps/api/src/services/taskService.js && node --check apps/api/src/services/queueService.js && node --check apps/api/src/services/storageService.js && node --check apps/api/src/services/collaborationService.js && node --check apps/api/src/services/yjsPersistenceService.js && node --check apps/api/src/services/projectArchiveService.js && node --check apps/api/src/services/imageGeneration.js && node --check apps/api/src/services/systemEventService.js && node --check apps/api/src/services/adminOverviewService.js && node --check apps/api/src/services/postgresStore.js && npm test && npm --prefix apps/web run build && npm --prefix apps/admin run build"
   }
 }

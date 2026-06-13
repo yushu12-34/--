@@ -87,6 +87,45 @@ npm run preflight
 
 - `data/db.json`
 
+7C-1U 已新增 PostgreSQL 可选后端。默认仍使用本地 JSON；客户端后端程序需要连接服务器 PostgreSQL 时，在 `.env` 中设置：
+
+```env
+DATA_BACKEND=postgres
+DATABASE_URL=postgresql://anime_canvas_app:真实密码@服务器局域网IP:5432/anime_canvas
+USER_FINGERPRINT_SECRET=至少32字节随机密钥
+```
+
+迁移前可先运行：
+
+```powershell
+npm run postgres:dry-run
+```
+
+正式迁移前可以用严格模式阻断坏引用：
+
+```powershell
+$env:POSTGRES_DRY_RUN_STRICT="true"; npm run postgres:dry-run
+```
+
+验证本机后端到服务器 PostgreSQL 的局域网连通性：
+
+```powershell
+$env:DATABASE_URL="postgresql://anime_canvas_app:真实密码@服务器局域网IP:5432/anime_canvas"; npm run postgres:smoke
+```
+
+正式迁移采用双保险命令：默认演练不写库，只有带 `--apply --confirm replace-postgres` 才会替换 PostgreSQL，并在写入前备份当前 PostgreSQL 快照：
+
+```powershell
+npm run postgres:migrate
+npm run postgres:migrate -- --apply --confirm replace-postgres
+```
+
+API 切到 PostgreSQL 后可做接口 smoke：
+
+```powershell
+npm run postgres:api-smoke
+```
+
 端口和模型服务地址可改 `.env`：
 
 - `API_PORT=8787`
@@ -123,10 +162,10 @@ scripts/   本地环境安装、启动、停止脚本
 
 仍需注意的边界：
 
-- 后端数据仍使用 `data/db.json` 本地 JSON 存储，尚未迁移到 PostgreSQL。
+- 后端数据默认仍使用 `data/db.json` 本地 JSON 存储；7C-1U 已接入 PostgreSQL 可选存储适配层，设置 `DATA_BACKEND=postgres` 后由后端通过局域网连接服务器 PostgreSQL。JSON 正式导入 PostgreSQL、用户指纹请求链路和跨用户权限隔离将在后续 7C-1V/1W 完成。
 - 协作当前已接入 Yjs update / state-vector / awareness 兼容桥，但仍保留旧 snapshot 协议作为兼容兜底。
 - 开发者模型配置后台已从客户创作端迁出到 `apps/admin`，内部接口优先使用本机访问限制；配置 `INTERNAL_ADMIN_TOKEN` 后需要后台请求携带 token。
 - 模型配置现在区分内部 `defaultParams` / `paramSchema` 与客户公开 `defaultPublicParams` / `publicParamSchema`。
 - 音频/视频节点和素材输入已具备，真实音频/视频生成适配器仍待开发。
 - 供应商密钥当前为开发环境本地 JSON 存储，接口会脱敏返回，但尚未加密落库。
-- 运行日志当前保存在 `data/db.json` 的 `systemEvents` 中，最多保留最近 500 条，尚未接入外部日志平台。
+- 运行日志当前保存在当前数据后端的 `systemEvents` / `system_events` 中，最多保留最近 500 条，尚未接入外部日志平台。
