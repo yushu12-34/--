@@ -1,4 +1,4 @@
-﻿:root {
+:root {
   --bg: #050505;
   --panel: rgba(255, 255, 255, 0.92);
   --line: rgba(255, 255, 255, 0.1);
@@ -898,6 +898,8 @@ textarea {
 
 .node-card {
   position: relative;
+  display: flex;
+  flex-direction: column;
   width: 286px;
   min-height: 168px;
   color: #eef2ff;
@@ -1244,6 +1246,7 @@ textarea {
   position: relative;
   display: grid;
   place-items: center;
+  flex: 1 1 auto;
   min-height: 120px;
   margin: 4px 10px 10px;
   border: 1px solid rgba(255, 255, 255, 0.22);

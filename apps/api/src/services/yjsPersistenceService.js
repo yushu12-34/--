@@ -1,5 +1,5 @@
 import * as Y from "yjs";
-import { updateJson } from "../db.js";
+import { persistYjsUpdateDirect, saveYjsSnapshotDirect, updateJson } from "../db.js";
 import { id, now } from "../utils/http.js";
 
 const DEFAULT_COMPACT_THRESHOLD = 24;
@@ -126,6 +126,15 @@ export function getCanvasYjsSnapshotDetail(db, canvasId, snapshotId) {
 export async function persistYjsUpdate(canvasId, update, options = {}) {
   const encodedUpdate = typeof update === "string" ? update : encodeYUpdate(update);
   const compactThreshold = Number(options.compactThreshold || DEFAULT_COMPACT_THRESHOLD);
+  const direct = await persistYjsUpdateDirect(canvasId, encodedUpdate, options);
+  if (direct.handled) {
+    let snapshotRecord = null;
+    if (direct.result?.pendingUpdateCount >= compactThreshold && options.doc instanceof Y.Doc) {
+      const snapshot = await saveYjsSnapshotDirect(canvasId, encodeYUpdate(Y.encodeStateAsUpdate(options.doc)), options);
+      snapshotRecord = snapshot.result;
+    }
+    return { update: direct.result?.update, snapshot: snapshotRecord };
+  }
   return updateJson((db) => {
     ensureWorkflowCollections(db);
     const timestamp = now();
@@ -165,6 +174,9 @@ export async function persistYjsUpdate(canvasId, update, options = {}) {
 }
 
 export async function saveYjsSnapshot(canvasId, doc) {
+  const encodedSnapshotUpdate = encodeYUpdate(Y.encodeStateAsUpdate(doc));
+  const direct = await saveYjsSnapshotDirect(canvasId, encodedSnapshotUpdate);
+  if (direct.handled) return direct.result;
   return updateJson((db) => {
     ensureWorkflowCollections(db);
     const timestamp = now();
@@ -177,7 +189,7 @@ export async function saveYjsSnapshot(canvasId, doc) {
       id: id("ysnapshot"),
       canvasId,
       clock: latestClock,
-      update: encodeYUpdate(Y.encodeStateAsUpdate(doc)),
+      update: encodedSnapshotUpdate,
       updateCount: db.workflowUpdates.filter((record) => record.canvasId === canvasId && Number(record.clock || 0) <= latestClock).length,
       createdAt: timestamp,
     };

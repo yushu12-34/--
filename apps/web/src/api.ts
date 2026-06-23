@@ -1,12 +1,17 @@
-import type { AITask, AssetRecord, CanvasRecord, CanvasSnapshot, ProjectBundle, ProjectRecord, UserRecord, YjsSnapshotDetail, YjsSnapshotRecord } from "./types";
+import type { AITask, AssetRecord, CanvasMemberRecord, CanvasRecord, CanvasSnapshot, ProjectBundle, ProjectRecord, UserRecord, YjsSnapshotDetail, YjsSnapshotRecord } from "./types";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "/api";
+
+function getCurrentUserId(): string {
+  return String(localStorage.getItem("anime-canvas-active-user-id") || "default-user");
+}
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...options,
     headers: {
       "content-type": "application/json",
+      "x-user-id": getCurrentUserId(),
       ...(options.headers || {}),
     },
   });
@@ -100,6 +105,23 @@ export function createCanvas(projectId: string, name: string) {
   return request<{ canvas: CanvasRecord }>(`/projects/${encodeURIComponent(projectId)}/canvases`, {
     method: "POST",
     body: JSON.stringify({ name }),
+  });
+}
+
+export function listCanvasMembers(canvasId: string) {
+  return request<{ members: CanvasMemberRecord[] }>(`/canvases/${encodeURIComponent(canvasId)}/members`);
+}
+
+export function inviteCanvasMember(canvasId: string, userId: string, role: "editor" | "viewer" = "editor") {
+  return request<{ member: CanvasMemberRecord }>(`/canvases/${encodeURIComponent(canvasId)}/members`, {
+    method: "POST",
+    body: JSON.stringify({ userId, role }),
+  });
+}
+
+export function removeCanvasMember(canvasId: string, userId: string) {
+  return request<{ removed: boolean }>(`/canvases/${encodeURIComponent(canvasId)}/members/${encodeURIComponent(userId)}`, {
+    method: "DELETE",
   });
 }
 

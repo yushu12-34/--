@@ -1,8 +1,8 @@
 import { copyFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { now } from "./utils/http.js";
-import { createPostgresStore } from "./services/postgresStore.js";
+import { id, now } from "./utils/http.js";
+import { createPostgresStore, listProjectsView, getProjectView, getCanvasView, listCanvasMembersView, listAssetsView, getTaskView, getAdminOverviewView, listAdminTasksView, getAdminTaskView, listSystemEventsView, listYjsHistoryView, getYjsHistorySnapshotView } from "./services/postgresStore.js";
 
 const DATA_DIR = process.env.DATA_DIR || path.resolve("data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
@@ -459,6 +459,7 @@ export function createDefaultDb(timestamp = now()) {
     users: [defaultUser(timestamp)],
     userDevices: [],
     projectMembers: [],
+    canvasMembers: [],
     projects: [],
     canvases: [],
     assets: [],
@@ -477,6 +478,7 @@ export function normalizeDb(db, timestamp = now()) {
   if (!Array.isArray(db.users) || db.users.length === 0) { db.users = [defaultUser(timestamp)]; changed = true; }
   if (!Array.isArray(db.userDevices)) { db.userDevices = []; changed = true; }
   if (!Array.isArray(db.projectMembers)) { db.projectMembers = []; changed = true; }
+  if (!Array.isArray(db.canvasMembers)) { db.canvasMembers = []; changed = true; }
   if (!Array.isArray(db.providers)) { db.providers = []; changed = true; }
   if (!Array.isArray(db.models)) { db.models = []; changed = true; }
   if (!Array.isArray(db.projects)) { db.projects = []; changed = true; }
@@ -559,9 +561,90 @@ export function normalizeDb(db, timestamp = now()) {
 }
 
 let postgresStore;
+let postgresReachable = null;
+let postgresReachableCheckedAt = 0;
+const POSTGRES_REACHABLE_CACHE_MS = 15_000;
 
-function isPostgresBackend() {
-  return DATA_BACKEND === "postgres" || DATA_BACKEND === "postgresql";
+async function isPostgresBackend() {
+  const configured = DATA_BACKEND === "postgres" || DATA_BACKEND === "postgresql";
+  if (!configured || !process.env.DATABASE_URL) return false;
+  const now = Date.now();
+  if (postgresReachable !== null && now - postgresReachableCheckedAt < POSTGRES_REACHABLE_CACHE_MS) {
+    return postgresReachable;
+  }
+  try {
+    // 复用现有连接池，避免每次都创建新池测试连接
+    const store = getPostgresStore();
+    const pool = await store.getPool();
+    const client = await pool.connect();
+    client.release();
+    postgresReachable = true;
+  } catch {
+    postgresReachable = false;
+  }
+  postgresReachableCheckedAt = now;
+  return postgresReachable;
+}
+
+export function resetPostgresReachability() {
+  postgresReachable = null;
+  postgresReachableCheckedAt = 0;
+}
+
+// 供 server.js 判断当前是否使用 PostgreSQL 后端
+export async function usePostgresBackend() {
+  return isPostgresBackend();
+}
+
+// 导出 PostgreSQL 专用只读视图方法
+export {
+  listProjectsView,
+  getProjectView,
+  getCanvasView,
+  listCanvasMembersView,
+  listAssetsView,
+  getTaskView,
+  getAdminOverviewView,
+  listAdminTasksView,
+  getAdminTaskView,
+  listSystemEventsView,
+  listYjsHistoryView,
+  getYjsHistorySnapshotView,
+};
+
+let readCache = null;
+let readCachePromise = null;
+
+function invalidateReadCache() {
+  readCache = null;
+  readCachePromise = null;
+}
+
+// 直接更新缓存中的单个实体，避免失效整个缓存导致下次读取重新加载所有数据
+function updateCacheEntry(collection, id, updater) {
+  if (!readCache || !Array.isArray(readCache[collection])) return;
+  const list = readCache[collection];
+  const index = list.findIndex((item) => item && item.id === id);
+  if (index >= 0) {
+    const updated = updater(list[index]);
+    if (updated) list[index] = updated;
+  } else if (updater(null)) {
+    list.push(updater(null));
+  }
+}
+
+// 从缓存中添加新实体
+function addCacheEntry(collection, entity) {
+  if (!readCache || !Array.isArray(readCache[collection])) return;
+  const list = readCache[collection];
+  if (!list.some((item) => item && item.id === entity.id)) {
+    list.push(entity);
+  }
+}
+
+function removeCacheEntries(collection, predicate) {
+  if (!readCache || !Array.isArray(readCache[collection])) return;
+  readCache[collection] = readCache[collection].filter((item) => !predicate(item));
 }
 
 function getPostgresStore() {
@@ -586,15 +669,48 @@ async function ensureJsonDb() {
   if (normalized.changed) await writeJsonFile(normalized.db);
 }
 
+let dataBackendLogged = false;
+let postgresEnsured = false;
+let postgresEnsurePromise = null;
+
 export async function ensureDb() {
-  if (isPostgresBackend()) return getPostgresStore().ensureDb();
+  const pg = await isPostgresBackend();
+  if (!dataBackendLogged) {
+    dataBackendLogged = true;
+    console.log(`data backend: ${pg ? "postgres" : "json"}`);
+  }
+  if (pg) {
+    // PostgreSQL 的 ensureDb 会获取全局 advisory lock 并可能全表重写，
+    // 只在进程启动后执行一次即可，后续读操作直接走 readJson。
+    // 使用 Promise 互斥锁确保并发的第一次调用只执行一次 ensureDb。
+    if (postgresEnsured) return;
+    if (!postgresEnsurePromise) {
+      postgresEnsurePromise = (async () => {
+        await getPostgresStore().ensureDb();
+        postgresEnsured = true;
+      })();
+    }
+    await postgresEnsurePromise;
+    return;
+  }
   return ensureJsonDb();
 }
 
 export async function readJson(shouldEnsure = true) {
-  if (isPostgresBackend()) {
+  if (await isPostgresBackend()) {
     if (shouldEnsure) await ensureDb();
-    return getPostgresStore().readJson();
+    // 使用内存缓存避免每次 readJson 都从 PostgreSQL 加载整个数据库快照（15MB+）。
+    // 多个并发请求共享同一个加载 Promise，避免并发 loadPostgresSnapshot 导致卡死。
+    if (readCache) return readCache;
+    if (!readCachePromise) {
+      readCachePromise = (async () => {
+        const data = await getPostgresStore().readJson();
+        readCache = data;
+        readCachePromise = null;
+        return data;
+      })();
+    }
+    return readCachePromise;
   }
   if (shouldEnsure) await ensureDb();
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -623,15 +739,17 @@ async function writeJsonFile(data) {
 }
 
 export async function writeJson(data) {
-  if (isPostgresBackend()) {
+  if (await isPostgresBackend()) {
     const next = dbQueue.then(() => getPostgresStore().writeJson(data));
     dbQueue = next.catch(() => {});
     await next;
+    invalidateReadCache();
     return;
   }
   const next = dbQueue.then(() => writeJsonFile(data));
   dbQueue = next.catch(() => {});
   await next;
+  invalidateReadCache();
 }
 
 export async function readJsonQueued() {
@@ -640,10 +758,13 @@ export async function readJsonQueued() {
 }
 
 export async function updateJson(mutator) {
-  if (isPostgresBackend()) {
+  if (await isPostgresBackend()) {
     const next = dbQueue.then(() => getPostgresStore().updateJson(mutator));
     dbQueue = next.then(() => undefined, () => undefined);
-    return next;
+    const result = await next;
+    // 写操作完成后再清除缓存，避免写操作期间所有读请求都穿透到 PostgreSQL
+    invalidateReadCache();
+    return result;
   }
   const next = dbQueue.then(async () => {
     const db = await readJson(false);
@@ -652,5 +773,196 @@ export async function updateJson(mutator) {
     return result;
   });
   dbQueue = next.then(() => undefined, () => undefined);
-  return next;
+  const result = await next;
+  invalidateReadCache();
+  return result;
+}
+
+// 直接更新单个 canvas 的 snapshot，避免 updateJson 的全表重写。
+// 仅在 PostgreSQL 模式下生效；JSON 模式回退到 updateJson。
+export async function updateCanvasSnapshot(canvasId, snapshot, updatedAt) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().updateCanvasSnapshot(canvasId, snapshot, updatedAt);
+    if (result) updateCacheEntry("canvases", canvasId, (existing) => ({ ...(existing || result), ...result, snapshot: snapshot || emptySnapshot, updatedAt }));
+    return result;
+  }
+  return updateJson((db) => {
+    const canvas = db.canvases.find((item) => item.id === canvasId);
+    if (!canvas) return null;
+    canvas.snapshot = snapshot || emptySnapshot;
+    canvas.updatedAt = updatedAt;
+    return canvas;
+  });
+}
+
+// 直接更新单个 model，避免 updateJson 的全表重写。
+export async function persistYjsUpdateDirect(canvasId, encodedUpdate, options = {}) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().persistYjsUpdate(canvasId, encodedUpdate, {
+      id: id("yupdate"),
+      snapshotId: id("ysnapshot"),
+      timestamp: now(),
+      ...options,
+    });
+    if (result?.update) addCacheEntry("workflowUpdates", result.update);
+    if (result?.snapshot) {
+      addCacheEntry("workflowSnapshots", result.snapshot);
+      removeCacheEntries("workflowUpdates", (record) => (
+        record?.canvasId === canvasId && Number(record.clock || 0) <= Number(result.snapshot.clock || 0)
+      ));
+    }
+    return { handled: true, result };
+  }
+  return { handled: false, result: null };
+}
+
+export async function saveYjsSnapshotDirect(canvasId, encodedSnapshotUpdate, options = {}) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().saveYjsSnapshot(canvasId, encodedSnapshotUpdate, {
+      id: id("ysnapshot"),
+      timestamp: now(),
+      ...options,
+    });
+    if (result) {
+      addCacheEntry("workflowSnapshots", result);
+      removeCacheEntries("workflowUpdates", (record) => record?.canvasId === canvasId);
+    }
+    return { handled: true, result };
+  }
+  return { handled: false, result: null };
+}
+
+export async function updateModel(modelId, patch) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().updateModel(modelId, patch);
+    if (result) updateCacheEntry("models", modelId, (existing) => ({ ...(existing || result), ...result }));
+    return result;
+  }
+  return updateJson((db) => {
+    const model = db.models.find((item) => item.id === modelId);
+    if (!model) return null;
+    for (const key of ["providerId", "name", "displayName", "type", "capabilities", "defaultParams", "defaultPublicParams", "paramSchema", "publicParamSchema", "adapter", "enabled", "sortOrder", "allowMockFallback"]) {
+      if (key in patch) model[key] = patch[key];
+    }
+    model.updatedAt = now();
+    return model;
+  });
+}
+
+// 直接更新单个 provider，避免 updateJson 的全表重写。
+export async function updateProvider(providerId, patch) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().updateProvider(providerId, patch);
+    if (result) updateCacheEntry("providers", providerId, (existing) => ({ ...(existing || result), ...result }));
+    return result;
+  }
+  return updateJson((db) => {
+    const provider = db.providers.find((item) => item.id === providerId);
+    if (!provider) return null;
+    for (const key of ["name", "type", "baseUrl", "authType", "timeoutSeconds", "enabled"]) {
+      if (key in patch) provider[key] = patch[key];
+    }
+    if ("secret" in patch || "secretValue" in patch) {
+      provider.secretValue = patch.secret || patch.secretValue || undefined;
+      provider.secretStorage = provider.secretValue ? "plain-local-json" : undefined;
+    }
+    provider.updatedAt = now();
+    return provider;
+  });
+}
+
+// 直接插入 user，避免 updateJson 的全表重写。
+export async function createUser(user) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().createUser(user);
+    addCacheEntry("users", user);
+    return result;
+  }
+  return updateJson((db) => {
+    if (!db.users) db.users = [];
+    db.users.push(user);
+    return user;
+  });
+}
+
+// 直接插入 project，避免 updateJson 的全表重写。
+export async function createProject(project) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().createProject(project);
+    addCacheEntry("projects", project);
+    return result;
+  }
+  return updateJson((db) => {
+    db.projects.push(project);
+    return project;
+  });
+}
+
+// 直接插入 canvas，避免 updateJson 的全表重写。
+export async function createCanvas(canvas) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().createCanvas(canvas);
+    addCacheEntry("canvases", canvas);
+    return result;
+  }
+  return updateJson((db) => {
+    db.canvases.push(canvas);
+    return canvas;
+  });
+}
+
+// 直接插入 task，避免 updateJson 的全表重写。
+export async function createTask(task) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().createTask(task);
+    addCacheEntry("tasks", task);
+    return result;
+  }
+  return updateJson((db) => {
+    db.tasks.unshift(task);
+    return task;
+  });
+}
+
+// 直接更新 task，避免 updateJson 的全表重写。
+export async function updateTask(taskId, patch) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().updateTask(taskId, patch);
+    if (result) updateCacheEntry("tasks", taskId, (existing) => ({ ...(existing || {}), ...result }));
+    return result;
+  }
+  return updateJson((db) => {
+    const task = db.tasks.find((item) => item.id === taskId);
+    if (!task) return null;
+    Object.assign(task, patch, { updatedAt: now() });
+    return task;
+  });
+}
+
+// 直接插入 asset，避免 updateJson 的全表重写。
+export async function createAsset(asset) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().createAsset(asset);
+    addCacheEntry("assets", asset);
+    return result;
+  }
+  return updateJson((db) => {
+    db.assets.unshift(asset);
+    return asset;
+  });
+}
+
+// 直接插入 system_event，避免 updateJson 的全表重写。
+export async function appendSystemEventDirect(event) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().appendSystemEvent(event);
+    addCacheEntry("systemEvents", event);
+    return result;
+  }
+  return updateJson((db) => {
+    if (!Array.isArray(db.systemEvents)) db.systemEvents = [];
+    db.systemEvents.unshift(event);
+    db.systemEvents = db.systemEvents.slice(0, 500);
+    return event;
+  });
 }

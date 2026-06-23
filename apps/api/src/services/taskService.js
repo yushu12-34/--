@@ -1,4 +1,4 @@
-import { readJsonQueued, updateJson } from "../db.js";
+import { readJsonQueued, createTask, updateTask, createAsset } from "../db.js";
 import { id, now } from "../utils/http.js";
 import { createMockImageResult, generateImageWithModel } from "./imageGeneration.js";
 import { enqueueTask } from "./queueService.js";
@@ -26,27 +26,25 @@ export async function createAiTask(body) {
   }
   const timestamp = now();
   const modelId = body.modelId || "z-image-turbo";
-  let task;
-  await updateJson((db) => {
-    const runtimeConfig = resolveTaskRuntimeConfig(db, modelId);
-    task = {
-      id: id("task"),
-      projectId: body.projectId,
-      canvasId: body.canvasId,
-      nodeId: body.nodeId,
-      modelId,
-      type: body.type,
-      status: "pending",
-      input: body.input || {},
-      progress: 0,
-      timeoutMs: runtimeConfig.timeoutMs,
-      pollIntervalMs: runtimeConfig.pollIntervalMs,
-      createdBy: "local-user",
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    };
-    db.tasks.unshift(task);
-  });
+  const db = await readJsonQueued();
+  const runtimeConfig = resolveTaskRuntimeConfig(db, modelId);
+  const task = {
+    id: id("task"),
+    projectId: body.projectId,
+    canvasId: body.canvasId,
+    nodeId: body.nodeId,
+    modelId,
+    type: body.type,
+    status: "pending",
+    input: body.input || {},
+    progress: 0,
+    timeoutMs: runtimeConfig.timeoutMs,
+    pollIntervalMs: runtimeConfig.pollIntervalMs,
+    createdBy: "local-user",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  await createTask(task);
   await enqueueTask(task);
   return { task };
 }
@@ -57,35 +55,29 @@ export async function getAiTask(taskId) {
 }
 
 export async function cancelAiTask(taskId) {
-  const task = await updateJson((db) => {
-    const item = db.tasks.find((candidate) => candidate.id === taskId);
-    if (!item) return null;
-    if (item.status === "succeeded" || item.status === "failed") return item;
-    item.status = "cancelled";
-    item.progress = 0;
-    item.error = "任务已取消";
-    item.updatedAt = now();
-    return item;
+  const db = await readJsonQueued();
+  const existing = db.tasks.find((item) => item.id === taskId);
+  if (!existing) return null;
+  if (existing.status === "succeeded" || existing.status === "failed") return existing;
+  const task = await updateTask(taskId, {
+    status: "cancelled",
+    progress: 0,
+    error: "任务已取消",
   });
   return task;
 }
 
 export async function retryAiTask(taskId) {
-  const timestamp = now();
-  const task = await updateJson((db) => {
-    const item = db.tasks.find((candidate) => candidate.id === taskId);
-    if (!item) return null;
-    if (item.status === "pending" || item.status === "running") return item;
-    const runtimeConfig = resolveTaskRuntimeConfig(db, item.modelId);
-    delete item.output;
-    delete item.error;
-    delete item.startedAt;
-    item.status = "pending";
-    item.progress = 0;
-    item.timeoutMs = runtimeConfig.timeoutMs;
-    item.pollIntervalMs = runtimeConfig.pollIntervalMs;
-    item.updatedAt = timestamp;
-    return item;
+  const db = await readJsonQueued();
+  const existing = db.tasks.find((item) => item.id === taskId);
+  if (!existing) return null;
+  if (existing.status === "pending" || existing.status === "running") return existing;
+  const runtimeConfig = resolveTaskRuntimeConfig(db, existing.modelId);
+  const task = await updateTask(taskId, {
+    status: "pending",
+    progress: 0,
+    timeoutMs: runtimeConfig.timeoutMs,
+    pollIntervalMs: runtimeConfig.pollIntervalMs,
   });
   if (task?.status === "pending") await enqueueTask(task);
   return task;
@@ -170,14 +162,11 @@ export async function runTask(taskId) {
       createdAt: finishedAt,
     };
 
-    await updateJson((latestDb) => {
-      const latestTask = latestDb.tasks.find((item) => item.id === taskId);
-      if (!latestTask || latestTask.status === "cancelled") return;
-      latestTask.status = "succeeded";
-      latestTask.progress = 100;
-      latestTask.output = { assetId: asset.id, url: imageUrl, providerTaskId: imageResult.providerTaskId, raw: imageResult.raw };
-      latestTask.updatedAt = finishedAt;
-      latestDb.assets.unshift(asset);
+    await createAsset(asset);
+    await updateTask(taskId, {
+      status: "succeeded",
+      progress: 100,
+      output: { assetId: asset.id, url: imageUrl, providerTaskId: imageResult.providerTaskId, raw: imageResult.raw },
     });
   } finally {
     runningTasks.delete(taskId);
@@ -185,13 +174,13 @@ export async function runTask(taskId) {
 }
 
 async function patchTask(taskId, patch, options = {}) {
-  return updateJson((db) => {
-    const task = db.tasks.find((item) => item.id === taskId);
-    if (!task) return false;
-    if (options.onlyStatus && task.status !== options.onlyStatus) return false;
-    Object.assign(task, patch, { updatedAt: now() });
-    return true;
-  });
+  if (options.onlyStatus) {
+    const db = await readJsonQueued();
+    const existing = db.tasks.find((item) => item.id === taskId);
+    if (!existing || existing.status !== options.onlyStatus) return false;
+  }
+  await updateTask(taskId, patch);
+  return true;
 }
 
 async function recordTaskFailure(task, error, metadata = {}) {

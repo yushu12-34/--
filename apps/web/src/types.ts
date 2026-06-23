@@ -114,10 +114,18 @@ export interface UserRecord {
 export interface CanvasRecord {
   id: string;
   projectId: string;
+  ownerId: string;
   name: string;
   snapshot: CanvasSnapshot;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface CanvasMemberRecord {
+  canvasId: string;
+  userId: string;
+  role: "owner" | "editor" | "viewer";
+  addedAt: string;
 }
 
 export interface YjsSnapshotRecord {

@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { emptySnapshot, ensureDb, readJson, updateJson } from "./db.js";
+import { emptySnapshot, ensureDb, readJson, updateJson, updateCanvasSnapshot, updateModel, updateProvider, createUser, createProject, createCanvas, createAsset, usePostgresBackend, listProjectsView, getProjectView, getCanvasView, listCanvasMembersView, listAssetsView, getTaskView, getAdminOverviewView, listAdminTasksView, getAdminTaskView, listSystemEventsView, listYjsHistoryView, getYjsHistorySnapshotView } from "./db.js";
 import { badRequest, id, isInternalAdminRequest, notFound, now, parseBody, publicModel, publicProvider, send } from "./utils/http.js";
 import { createAiTask, getAiTask, cancelAiTask, retryAiTask, runTask } from "./services/taskService.js";
 import { initializeTaskQueue } from "./services/queueService.js";
@@ -17,7 +17,7 @@ async function handle(req, res) {
       "content-type": "application/json; charset=utf-8",
       "access-control-allow-origin": "*",
       "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-      "access-control-allow-headers": "content-type,authorization",
+      "access-control-allow-headers": "content-type,authorization,x-user-id",
     });
     res.end();
     return;
@@ -36,7 +36,8 @@ async function handle(req, res) {
       return;
     }
 
-    const db = await readJson();
+    // PostgreSQL 专用读取路径：对已优化的 GET 路由直接查询，避免 readJson() 整库快照加载
+    const pg = await usePostgresBackend();
 
     if (isInternalPath && !isInternalAdminRequest(req)) {
       await recordRuntimeEvent({
@@ -50,6 +51,131 @@ async function handle(req, res) {
       return;
     }
 
+    // ── PostgreSQL 专用 GET 路由（不调用 readJson） ──
+
+    if (pg && req.method === "GET" && pathname === "/api/projects") {
+      const requestUserId = String(req.headers["x-user-id"] || url.searchParams.get("userId") || "");
+      const projects = await listProjectsView(requestUserId);
+      send(res, 200, { projects });
+      return;
+    }
+
+    if (pg && req.method === "GET" && pathname === "/api/models") {
+      // models 列表需要读取 providers 关联，暂用 readJson
+      // 后续可增加 listModelsView 专用方法
+    }
+
+    if (pg && req.method === "GET") {
+      const _pm = pathname.match(/^\/api\/projects\/([^/]+)$/);
+      if (_pm) {
+        const requestUserId = String(req.headers["x-user-id"] || url.searchParams.get("userId") || "");
+        const result = await getProjectView(_pm[1], requestUserId);
+        if (!result) return notFound(res);
+        send(res, 200, result);
+        return;
+      }
+    }
+
+    if (pg && req.method === "GET") {
+      const _cm = pathname.match(/^\/api\/canvases\/([^/]+)$/);
+      if (_cm && !pathname.includes("/members") && !pathname.includes("/snapshot") && !pathname.includes("/yjs-")) {
+        const canvas = await getCanvasView(_cm[1]);
+        if (!canvas) return notFound(res);
+        send(res, 200, { canvas });
+        return;
+      }
+    }
+
+    if (pg && req.method === "GET") {
+      const _cmm = pathname.match(/^\/api\/canvases\/([^/]+)\/members$/);
+      if (_cmm) {
+        const members = await listCanvasMembersView(_cmm[1]);
+        if (!members) return notFound(res);
+        send(res, 200, { members });
+        return;
+      }
+    }
+
+    if (pg && req.method === "GET" && pathname === "/api/assets") {
+      const projectId = url.searchParams.get("projectId");
+      const assets = await listAssetsView(projectId || "");
+      send(res, 200, { assets });
+      return;
+    }
+
+    if (pg && req.method === "GET") {
+      const _tm = pathname.match(/^\/api\/ai\/tasks\/([^/]+)$/);
+      if (_tm) {
+        try {
+          const task = await getTaskView(_tm[1]);
+          if (!task) return notFound(res);
+          send(res, 200, { task });
+        } catch (taskError) {
+          send(res, 503, {
+            error: "Service Unavailable",
+            message: taskError instanceof Error ? taskError.message : String(taskError),
+          });
+        }
+        return;
+      }
+    }
+
+    if (pg && req.method === "GET" && internalPathname === "/internal/overview") {
+      const overview = await getAdminOverviewView();
+      send(res, 200, { overview });
+      return;
+    }
+
+    if (pg && req.method === "GET" && internalPathname === "/internal/tasks") {
+      const limit = url.searchParams.get("limit") || 200;
+      const tasks = await listAdminTasksView(limit);
+      send(res, 200, { tasks });
+      return;
+    }
+
+    if (pg && req.method === "GET") {
+      const _itm = internalPathname.match(/^\/internal\/tasks\/([^/]+)$/);
+      if (_itm) {
+        const task = await getAdminTaskView(_itm[1]);
+        if (!task) return notFound(res);
+        send(res, 200, { task });
+        return;
+      }
+    }
+
+    if (pg && req.method === "GET" && internalPathname === "/internal/system-events") {
+      const result = await listSystemEventsView({
+        level: url.searchParams.get("level"),
+        category: url.searchParams.get("category"),
+        limit: url.searchParams.get("limit"),
+      });
+      send(res, 200, result);
+      return;
+    }
+
+    if (pg && req.method === "GET") {
+      const _yhm = pathname.match(/^\/api\/canvases\/([^/]+)\/yjs-history$/);
+      if (_yhm) {
+        const snapshots = await listYjsHistoryView(_yhm[1]);
+        send(res, 200, { snapshots });
+        return;
+      }
+    }
+
+    if (pg && req.method === "GET") {
+      const _yhdm = pathname.match(/^\/api\/canvases\/([^/]+)\/yjs-history\/([^/]+)$/);
+      if (_yhdm) {
+        const detail = await getYjsHistorySnapshotView(_yhdm[1], _yhdm[2]);
+        if (!detail) return notFound(res);
+        send(res, 200, detail);
+        return;
+      }
+    }
+
+    // ── 未命中 PostgreSQL 专用路径，回退到 readJson() ──
+
+    const db = await readJson();
+
     if (req.method === "GET" && pathname === "/api/models") {
       const models = (db.models || [])
         .filter((model) => model.enabled !== false)
@@ -60,7 +186,16 @@ async function handle(req, res) {
     }
 
     if (req.method === "GET" && pathname === "/api/projects") {
-      send(res, 200, { projects: buildProjectList(db) });
+      const requestUserId = String(req.headers["x-user-id"] || url.searchParams.get("userId") || "");
+      const allProjects = buildProjectList(db);
+      const projects = requestUserId
+        ? allProjects.filter((project) => {
+            if (project.ownerId === requestUserId) return true;
+            const members = Array.isArray(db.projectMembers) ? db.projectMembers : [];
+            return members.some((m) => m.projectId === project.id && m.userId === requestUserId);
+          })
+        : allProjects;
+      send(res, 200, { projects });
       return;
     }
 
@@ -75,39 +210,37 @@ async function handle(req, res) {
       const user = {
         id: body.id || id("user"),
         name: String(body.name || "新用户"),
+        displayName: String(body.name || "新用户"),
         createdAt: timestamp,
         updatedAt: timestamp,
       };
-      await updateJson((latestDb) => {
-        if (!latestDb.users) latestDb.users = [];
-        latestDb.users.push(user);
-      });
-      send(res, 201, { user });
+      await createUser(user);
+      send(res, 201, { user: { id: user.id, name: user.name, createdAt: user.createdAt, updatedAt: user.updatedAt } });
       return;
     }
 
     if (req.method === "POST" && pathname === "/api/projects") {
       const body = await parseBody(req);
       const timestamp = now();
+      const ownerId = String(body.ownerId || body.userId || "default-user");
       const project = {
         id: id("project"),
         name: String(body.name || "未命名动漫项目"),
-        ownerId: String(body.ownerId || body.userId || "default-user"),
+        ownerId,
         createdAt: timestamp,
         updatedAt: timestamp,
       };
       const canvas = {
         id: id("canvas"),
         projectId: project.id,
+        ownerId,
         name: "主画布",
         snapshot: emptySnapshot,
         createdAt: timestamp,
         updatedAt: timestamp,
       };
-      await updateJson((latestDb) => {
-        latestDb.projects.push(project);
-        latestDb.canvases.push(canvas);
-      });
+      await createProject(project);
+      await createCanvas(canvas);
       send(res, 201, { project, canvas });
       return;
     }
@@ -116,7 +249,13 @@ async function handle(req, res) {
     if (projectMatch && req.method === "GET") {
       const project = db.projects.find((item) => item.id === projectMatch[1]);
       if (!project) return notFound(res);
-      const canvases = db.canvases.filter((item) => item.projectId === project.id);
+      const requestUserId = String(req.headers["x-user-id"] || url.searchParams.get("userId") || project.ownerId || "default-user");
+      const canvases = db.canvases.filter((item) => {
+        if (item.projectId !== project.id) return false;
+        if (item.ownerId === requestUserId) return true;
+        const members = Array.isArray(db.canvasMembers) ? db.canvasMembers : [];
+        return members.some((m) => m.canvasId === item.id && m.userId === requestUserId);
+      });
       send(res, 200, { project, canvases });
       return;
     }
@@ -127,19 +266,17 @@ async function handle(req, res) {
       const project = db.projects.find((item) => item.id === projectCanvasMatch[1]);
       if (!project) return notFound(res);
       const timestamp = now();
+      const requestUserId = String(body.ownerId || body.userId || project.ownerId || "default-user");
       const canvas = {
         id: id("canvas"),
         projectId: project.id,
+        ownerId: requestUserId,
         name: String(body.name || `画布 ${db.canvases.filter((item) => item.projectId === project.id).length + 1}`),
         snapshot: emptySnapshot,
         createdAt: timestamp,
         updatedAt: timestamp,
       };
-      await updateJson((latestDb) => {
-        latestDb.canvases.push(canvas);
-        const latestProject = latestDb.projects.find((item) => item.id === project.id);
-        if (latestProject) latestProject.updatedAt = timestamp;
-      });
+      await createCanvas(canvas);
       send(res, 201, { canvas });
       return;
     }
@@ -255,6 +392,9 @@ async function handle(req, res) {
         const projectCanvases = latestDb.canvases.filter((item) => item.projectId === canvas.projectId);
         if (projectCanvases.length <= 1) return { error: "至少保留一个画布" };
         latestDb.canvases = latestDb.canvases.filter((item) => item.id !== canvas.id);
+        if (Array.isArray(latestDb.canvasMembers)) {
+          latestDb.canvasMembers = latestDb.canvasMembers.filter((m) => m.canvasId !== canvas.id);
+        }
         const latestProject = latestDb.projects.find((item) => item.id === canvas.projectId);
         if (latestProject) latestProject.updatedAt = now();
         return { deletedCanvas: canvas, nextCanvas: projectCanvases.find((item) => item.id !== canvas.id) };
@@ -262,6 +402,64 @@ async function handle(req, res) {
       if (!result) return notFound(res);
       if (result.error) return badRequest(res, result.error);
       send(res, 200, result);
+      return;
+    }
+
+    // 画布成员管理：列出画布的所有成员
+    const canvasMembersMatch = pathname.match(/^\/api\/canvases\/([^/]+)\/members$/);
+    if (canvasMembersMatch && req.method === "GET") {
+      const canvas = db.canvases.find((item) => item.id === canvasMembersMatch[1]);
+      if (!canvas) return notFound(res);
+      const members = (Array.isArray(db.canvasMembers) ? db.canvasMembers : [])
+        .filter((m) => m.canvasId === canvas.id)
+        .map((m) => ({ ...m }));
+      const ownerEntry = { canvasId: canvas.id, userId: canvas.ownerId || canvas.projectId, role: "owner", addedAt: canvas.createdAt };
+      const filteredMembers = members.some((m) => m.userId === ownerEntry.userId)
+        ? members
+        : [ownerEntry, ...members];
+      send(res, 200, { members: filteredMembers });
+      return;
+    }
+
+    // 画布成员管理：邀请用户加入画布
+    if (canvasMembersMatch && req.method === "POST") {
+      const body = await parseBody(req);
+      const canvas = db.canvases.find((item) => item.id === canvasMembersMatch[1]);
+      if (!canvas) return notFound(res);
+      if (!body.userId) return badRequest(res, "userId is required");
+      const role = body.role === "viewer" ? "viewer" : "editor";
+      const addedAt = now();
+      const member = { canvasId: canvas.id, userId: String(body.userId), role, addedAt };
+      await updateJson((latestDb) => {
+        if (!Array.isArray(latestDb.canvasMembers)) latestDb.canvasMembers = [];
+        const existing = latestDb.canvasMembers.find((m) => m.canvasId === canvas.id && m.userId === member.userId);
+        if (existing) {
+          existing.role = role;
+          existing.addedAt = addedAt;
+        } else {
+          latestDb.canvasMembers.push(member);
+        }
+        return member;
+      });
+      send(res, 201, { member });
+      return;
+    }
+
+    // 画布成员管理：移除成员
+    const canvasMemberMatch = pathname.match(/^\/api\/canvases\/([^/]+)\/members\/([^/]+)$/);
+    if (canvasMemberMatch && req.method === "DELETE") {
+      const [, canvasId, userId] = canvasMemberMatch;
+      const canvas = db.canvases.find((item) => item.id === canvasId);
+      if (!canvas) return notFound(res);
+      if (canvas.ownerId === userId) return badRequest(res, "不能移除画布归属者");
+      await updateJson((latestDb) => {
+        if (!Array.isArray(latestDb.canvasMembers)) return null;
+        const existing = latestDb.canvasMembers.find((m) => m.canvasId === canvasId && m.userId === userId);
+        if (!existing) return null;
+        latestDb.canvasMembers = latestDb.canvasMembers.filter((m) => !(m.canvasId === canvasId && m.userId === userId));
+        return existing;
+      });
+      send(res, 200, { removed: true });
       return;
     }
 
@@ -292,13 +490,8 @@ async function handle(req, res) {
       const body = await parseBody(req);
       const shouldBackup = body.backupOperation === "history-restore";
       const backup = shouldBackup ? await createRequiredDbBackup("history-restore") : undefined;
-      const updatedCanvas = await updateJson((latestDb) => {
-        const canvas = latestDb.canvases.find((item) => item.id === snapshotMatch[1]);
-        if (!canvas) return null;
-        canvas.snapshot = body.snapshot || emptySnapshot;
-        canvas.updatedAt = now();
-        return canvas;
-      });
+      // 直接更新单条 canvas snapshot，避免 PostgreSQL 全表重写导致的性能问题
+      const updatedCanvas = await updateCanvasSnapshot(snapshotMatch[1], body.snapshot || emptySnapshot, now());
       if (!updatedCanvas) return notFound(res);
       send(res, 200, { canvas: updatedCanvas, backup });
       return;
@@ -360,9 +553,7 @@ async function handle(req, res) {
         createdBy: body.createdBy || "local-user",
         createdAt: now(),
       };
-      await updateJson((latestDb) => {
-        latestDb.assets.unshift(asset);
-      });
+      await createAsset(asset);
       send(res, 201, { asset });
       return;
     }
@@ -606,19 +797,7 @@ async function handle(req, res) {
     const providerMatch = internalPathname.match(/^\/internal\/providers\/([^/]+)$/);
     if (providerMatch && req.method === "PATCH") {
       const body = await parseBody(req);
-      const updatedProvider = await updateJson((latestDb) => {
-        const provider = latestDb.providers.find((item) => item.id === providerMatch[1]);
-        if (!provider) return null;
-        for (const key of ["name", "type", "baseUrl", "authType", "timeoutSeconds", "enabled"]) {
-          if (key in body) provider[key] = body[key];
-        }
-        if ("secret" in body || "secretValue" in body) {
-          provider.secretValue = body.secret || body.secretValue || undefined;
-          provider.secretStorage = provider.secretValue ? "plain-local-json" : undefined;
-        }
-        provider.updatedAt = now();
-        return provider;
-      });
+      const updatedProvider = await updateProvider(providerMatch[1], body);
       if (!updatedProvider) return notFound(res);
       await recordRuntimeEvent({
         level: "info",
@@ -675,15 +854,7 @@ async function handle(req, res) {
     const modelMatch = internalPathname.match(/^\/internal\/models\/([^/]+)$/);
     if (modelMatch && req.method === "PATCH") {
       const body = await parseBody(req);
-      const updatedModel = await updateJson((latestDb) => {
-        const model = latestDb.models.find((item) => item.id === modelMatch[1]);
-        if (!model) return null;
-        for (const key of ["providerId", "name", "displayName", "type", "capabilities", "defaultParams", "defaultPublicParams", "paramSchema", "publicParamSchema", "adapter", "enabled", "sortOrder", "allowMockFallback"]) {
-          if (key in body) model[key] = body[key];
-        }
-        model.updatedAt = now();
-        return model;
-      });
+      const updatedModel = await updateModel(modelMatch[1], body);
       if (!updatedModel) return notFound(res);
       await recordRuntimeEvent({
         level: "info",
@@ -773,6 +944,13 @@ async function recordRuntimeEvent(event) {
 }
 
 await ensureDb();
+// 预加载缓存，避免首次请求超时
+try {
+  await readJson();
+  console.log("database cache preloaded");
+} catch (error) {
+  console.warn("failed to preload database cache:", error instanceof Error ? error.message : String(error));
+}
 const queueStatus = await initializeTaskQueue(runTask);
 await recordRuntimeEvent({
   level: "info",

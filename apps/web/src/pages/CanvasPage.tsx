@@ -8,6 +8,7 @@ import {
   BackgroundVariant,
   SelectionMode,
   useReactFlow,
+  useUpdateNodeInternals,
   useViewport,
   ViewportPortal,
   useEdgesState,
@@ -175,6 +176,7 @@ function getTaskDeadlineAt(task: AITask | null | undefined, fallbackStartedAt: n
 
 export function CanvasPage() {
   const { screenToFlowPosition, setViewport, fitView } = useReactFlow<WorkflowReactNode, WorkflowReactEdge>();
+  const updateNodeInternals = useUpdateNodeInternals();
   const viewport = useViewport();
   const { zoom } = viewport;
   const containerRef = useRef<HTMLDivElement>(null);
@@ -317,6 +319,24 @@ export function CanvasPage() {
   useEffect(() => {
     expandedNodeIdRef.current = expandedNodeId;
   }, [expandedNodeId]);
+
+  // 节点展开/收起后，需要通知 React Flow 重新测量节点尺寸并刷新连接线端点位置。
+  // CSS 过渡动画约 180ms，在动画结束后再次刷新以确保最终尺寸正确。
+  const prevExpandedNodeIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const targets = new Set<string>();
+    if (expandedNodeId) targets.add(expandedNodeId);
+    const prev = prevExpandedNodeIdRef.current;
+    if (prev && prev !== expandedNodeId) targets.add(prev);
+    prevExpandedNodeIdRef.current = expandedNodeId;
+    if (targets.size === 0) return;
+    const rafId = requestAnimationFrame(() => targets.forEach((nodeId) => updateNodeInternals(nodeId)));
+    const timerId = window.setTimeout(() => targets.forEach((nodeId) => updateNodeInternals(nodeId)), 220);
+    return () => {
+      cancelAnimationFrame(rafId);
+      window.clearTimeout(timerId);
+    };
+  }, [expandedNodeId, updateNodeInternals]);
   useEffect(() => {
     selectedNodeIdRef.current = selectedNodeId;
   }, [selectedNodeId]);

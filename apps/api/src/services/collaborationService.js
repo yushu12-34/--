@@ -241,7 +241,7 @@ export function attachCollaborationServer(server) {
       if (payload.type === "yjs:update") {
         const ydoc = await getRoomYDoc(canvasId);
         if (!applyEncodedYUpdate(ydoc, payload.update, clientId)) return;
-        persistYjsUpdate(canvasId, payload.update).catch((error) => {
+        persistYjsUpdate(canvasId, payload.update, { doc: ydoc }).catch((error) => {
           console.error("failed to persist yjs update", error);
         });
         broadcast(room, {

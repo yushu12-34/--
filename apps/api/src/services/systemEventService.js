@@ -1,4 +1,4 @@
-import { updateJson } from "../db.js";
+import { appendSystemEventDirect } from "../db.js";
 import { id, now } from "../utils/http.js";
 
 const DEFAULT_LIMIT = 100;
@@ -30,7 +30,10 @@ function sanitizeMetadataValue(value, depth = 0) {
 }
 
 function normalizeLevel(level) {
-  return ["info", "warn", "warning", "error"].includes(level) ? level : "info";
+  const normalized = String(level || "").toLowerCase();
+  if (normalized === "warn" || normalized === "warning") return "warning";
+  if (normalized === "error") return "error";
+  return "info";
 }
 
 function normalizeCategory(category) {
@@ -56,7 +59,17 @@ export function appendSystemEvent(db, event, options = {}) {
 }
 
 export async function recordSystemEvent(event, options = {}) {
-  return updateJson((db) => appendSystemEvent(db, event, options));
+  const timestamp = event.createdAt || now();
+  const nextEvent = {
+    id: event.id || id("event"),
+    level: normalizeLevel(event.level),
+    category: normalizeCategory(event.category),
+    source: String(event.source || "api"),
+    message: String(event.message || "系统事件"),
+    metadata: sanitizeMetadataValue(event.metadata || {}),
+    createdAt: timestamp,
+  };
+  return appendSystemEventDirect(nextEvent);
 }
 
 export function summarizeSystemEvents(events = []) {
@@ -86,8 +99,8 @@ export function listSystemEvents(db, filters = {}) {
   const limit = Math.min(Math.max(Number(filters.limit || DEFAULT_LIMIT), 1), MAX_EVENTS);
   const allEvents = Array.isArray(db.systemEvents) ? db.systemEvents : [];
   const events = allEvents
-    .filter((event) => !level || event.level === level)
-    .filter((event) => !category || event.category === category)
+    .filter((event) => !level || normalizeLevel(event.level) === level)
+    .filter((event) => !category || normalizeCategory(event.category) === category)
     .slice(0, limit);
 
   return {
