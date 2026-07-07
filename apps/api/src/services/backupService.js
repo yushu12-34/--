@@ -18,6 +18,16 @@ function timestampForFilename(date = new Date()) {
 }
 
 export async function createDbBackup(operation, options = {}) {
+  const backend = String(process.env.DATA_BACKEND || "json").toLowerCase();
+  if (backend === "postgres" || backend === "postgresql") {
+    return {
+      operation: sanitizeOperation(operation),
+      file: null,
+      storage: "postgres",
+      skipped: true,
+      createdAt: (options.now || new Date()).toISOString(),
+    };
+  }
   const dbFile = options.dbFile || DEFAULT_DB_FILE;
   const backupDir = options.backupDir || DEFAULT_BACKUP_DIR;
   const safeOperation = sanitizeOperation(operation);

@@ -7,11 +7,12 @@ import * as Y from "../apps/api/node_modules/yjs/dist/yjs.mjs";
 import { applyEncodedYUpdate, createYjsSyncPayload, decodeYUpdate, encodeYUpdate, sanitizeAwarenessWireState } from "../apps/api/src/services/collaborationService.js";
 import { buildAdminOverview, enrichAdminTask, selectRetryableAdminTasks } from "../apps/api/src/services/adminOverviewService.js";
 import { createDbBackup, createRequiredDbBackup } from "../apps/api/src/services/backupService.js";
+import { createDefaultDb, normalizeDb } from "../apps/api/src/db.js";
 import { buildProjectBundle, buildProjectList, copyProject, deleteProjectGraph, importProjectBundle, validateProjectBundle } from "../apps/api/src/services/projectArchiveService.js";
 import { appendSystemEvent, listSystemEvents } from "../apps/api/src/services/systemEventService.js";
 import { resolveTaskRuntimeConfig } from "../apps/api/src/services/taskService.js";
 import { buildYDocFromPersistence, getCanvasYjsPersistence, getCanvasYjsSnapshotDetail, listCanvasYjsSnapshots } from "../apps/api/src/services/yjsPersistenceService.js";
-import { renderAdapterTemplate } from "../apps/api/src/services/imageGeneration.js";
+import { generateImageWithModel, generateVideoWithModel, renderAdapterTemplate } from "../apps/api/src/services/imageGeneration.js";
 import { isInternalAdminRequest, publicModel, publicProvider } from "../apps/api/src/utils/http.js";
 
 test("publicProvider hides local secret values and exposes only hasSecret", () => {
@@ -142,7 +143,7 @@ test("custom HTTP adapter templates render nested request values", () => {
     count: "{params.n}",
     image: "{{images.0}}",
     nested: {
-      task: "/v1/tasks/{task_id}",
+      task: "/v1/images/tasks/{task_id}",
     },
   }, {
     prompt: "画一张动漫海报",
@@ -157,9 +158,261 @@ test("custom HTTP adapter templates render nested request values", () => {
     count: 1,
     image: "https://example.test/ref.png",
     nested: {
-      task: "/v1/tasks/task-1",
+      task: "/v1/images/tasks/task-1",
     },
   });
+});
+
+test("built-in Z-Image models use the current images task polling API", () => {
+  const db = createDefaultDb("2026-07-03T00:00:00.000Z");
+  const turbo = db.models.find((model) => model.id === "z-image-turbo");
+  const standard = db.models.find((model) => model.id === "z-image");
+
+  assert.equal(turbo.adapter.taskPathTemplate, "/v1/images/tasks/{task_id}");
+  assert.equal(turbo.defaultParams.model, "z-image-turbo");
+  assert.equal(standard.adapter.taskPathTemplate, "/v1/images/tasks/{task_id}");
+  assert.equal(standard.defaultParams.num_inference_steps, 40);
+
+  turbo.adapter.configVersion = "legacy";
+  turbo.adapter.taskPathTemplate = "/v1/tasks/{task_id}";
+  delete turbo.defaultParams.model;
+  standard.adapter.configVersion = "legacy";
+  standard.adapter.taskPathTemplate = "/v1/tasks/{task_id}";
+  standard.defaultParams.num_inference_steps = 50;
+
+  const normalized = normalizeDb(db, "2026-07-03T00:01:00.000Z");
+  assert.equal(normalized.changed, true);
+  assert.equal(turbo.adapter.taskPathTemplate, "/v1/images/tasks/{task_id}");
+  assert.equal(turbo.defaultParams.model, "z-image-turbo");
+  assert.equal(standard.adapter.taskPathTemplate, "/v1/images/tasks/{task_id}");
+  assert.equal(standard.defaultParams.num_inference_steps, 40);
+});
+
+test("built-in Seedance video models use Ark contents task API", () => {
+  const db = createDefaultDb("2026-07-03T00:00:00.000Z");
+  const provider = db.providers.find((item) => item.id === "volcengine-ark");
+  const standard = db.models.find((model) => model.id === "seedance-2");
+  const fast = db.models.find((model) => model.id === "seedance-2-fast");
+
+  assert.equal(provider.baseUrl, "https://ark.cn-beijing.volces.com/api/v3");
+  assert.equal(provider.authType, "bearer");
+  assert.equal(standard.type, "video");
+  assert.equal(standard.defaultParams.model, "doubao-seedance-2-0-260128");
+  assert.equal(standard.adapter.submitPath, "/contents/generations/tasks");
+  assert.equal(standard.adapter.taskPathTemplate, "/contents/generations/tasks/{task_id}");
+  assert.equal(standard.adapter.resultPath, "content.video_url");
+  assert.equal(fast.defaultParams.model, "doubao-seedance-2-0-fast-260128");
+  assert.deepEqual(fast.publicParamSchema.resolution.options, ["480p", "720p"]);
+});
+
+test("seedance video adapter creates content generation task and resolves video url", async () => {
+  const previousFetch = globalThis.fetch;
+  const requests = [];
+  try {
+    globalThis.fetch = async (url, options = {}) => {
+      requests.push({
+        url: String(url),
+        headers: options.headers || {},
+        body: options.body ? JSON.parse(options.body) : undefined,
+      });
+      if (String(url).endsWith("/contents/generations/tasks") && options.method === "POST") {
+        return new Response(JSON.stringify({ id: "cgt-1" }), { status: 200 });
+      }
+      if (String(url).endsWith("/contents/generations/tasks/cgt-1")) {
+        return new Response(JSON.stringify({
+          id: "cgt-1",
+          status: "succeeded",
+          content: { video_url: "https://cdn.test/video.mp4" },
+        }), { status: 200 });
+      }
+      return new Response("{}", { status: 404 });
+    };
+
+    const result = await generateVideoWithModel(
+      { enabled: true, baseUrl: "https://ark.cn-beijing.volces.com/api/v3", authType: "bearer", secretValue: "ark-key", timeoutSeconds: 1 },
+      {
+        enabled: true,
+        defaultParams: {
+          model: "doubao-seedance-2-0-260128",
+          resolution: "720p",
+          ratio: "16:9",
+          duration: 5,
+          generate_audio: true,
+          watermark: false,
+          web_search: true,
+        },
+        adapter: {
+          kind: "seedance-video",
+          submitPath: "/contents/generations/tasks",
+          taskPathTemplate: "/contents/generations/tasks/{task_id}",
+          resultPath: "content.video_url",
+          pollIntervalMs: 1,
+          timeoutMs: 100,
+        },
+      },
+      {
+        prompt: "first person tea ad",
+        params: { duration: 8 },
+        images: ["https://asset.test/frame.png"],
+        videos: ["https://asset.test/ref.mp4"],
+        audios: ["https://asset.test/music.mp3"],
+      },
+    );
+
+    assert.equal(result.providerTaskId, "cgt-1");
+    assert.equal(result.url, "https://cdn.test/video.mp4");
+    assert.equal(requests[0].headers.authorization, "Bearer ark-key");
+    assert.deepEqual(requests[0].body, {
+      model: "doubao-seedance-2-0-260128",
+      resolution: "720p",
+      ratio: "16:9",
+      duration: 8,
+      generate_audio: true,
+      watermark: false,
+      tools: [{ type: "web_search" }],
+      content: [
+        { type: "text", text: "first person tea ad" },
+        { type: "image_url", image_url: { url: "https://asset.test/frame.png" }, role: "reference_image" },
+        { type: "video_url", video_url: { url: "https://asset.test/ref.mp4" }, role: "reference_video" },
+        { type: "audio_url", audio_url: { url: "https://asset.test/music.mp3" }, role: "reference_audio" },
+      ],
+    });
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("seedance defaults upsert preserves existing Ark provider secret", async () => {
+  const previousDataDir = process.env.DATA_DIR;
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "seedance-db-"));
+  try {
+    process.env.DATA_DIR = tempDir;
+    const { ensureDb, updateProvider, readJsonQueued, upsertSeedanceDefaults } = await import(`../apps/api/src/db.js?seedance=${Date.now()}`);
+    await ensureDb();
+    await updateProvider("volcengine-ark", { secretValue: "existing-key" });
+
+    const result = await upsertSeedanceDefaults();
+    const db = await readJsonQueued();
+    const provider = db.providers.find((item) => item.id === "volcengine-ark");
+    const modelIds = db.models.filter((item) => item.type === "video").map((item) => item.id).sort();
+
+    assert.equal(result.models.length, 2);
+    assert.equal(provider.secretValue, "existing-key");
+    assert.deepEqual(modelIds, ["seedance-2", "seedance-2-fast"]);
+  } finally {
+    if (previousDataDir === undefined) {
+      delete process.env.DATA_DIR;
+    } else {
+      process.env.DATA_DIR = previousDataDir;
+    }
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("z-image adapter uses model request template and mapped polling fields", async () => {
+  const previousFetch = globalThis.fetch;
+  const requests = [];
+  try {
+    globalThis.fetch = async (url, options = {}) => {
+      requests.push({ url: String(url), body: options.body ? JSON.parse(options.body) : undefined });
+      if (String(url).endsWith("/v1/images/generations")) {
+        return new Response(JSON.stringify({ id: "task-1", state: "queued" }), { status: 200 });
+      }
+      if (String(url).endsWith("/v1/jobs/task-1")) {
+        return new Response(JSON.stringify({ state: "completed", output: [{ image_url: "/static/task-1.png" }] }), { status: 200 });
+      }
+      return new Response("{}", { status: 404 });
+    };
+
+    const result = await generateImageWithModel(
+      { enabled: true, baseUrl: "http://provider.test", timeoutSeconds: 1 },
+      {
+        enabled: true,
+        defaultParams: { size: "1k", n: 1, optional: "" },
+        adapter: {
+          kind: "z-image-turbo",
+          submitPath: "/v1/images/generations",
+          requestTemplate: {
+            prompt: "{prompt}",
+            image_size: "{params.size}",
+            samples: "{params.n}",
+            optional: "{params.optional}",
+          },
+          taskIdPath: "id",
+          taskPathTemplate: "/v1/jobs/{task_id}",
+          statusPath: "state",
+          successStatusValues: ["completed"],
+          resultPath: "output.0.image_url",
+          pollIntervalMs: 1,
+          timeoutMs: 100,
+        },
+      },
+      { prompt: "city skyline", params: { size: "720p" } },
+    );
+
+    assert.equal(result.providerTaskId, "task-1");
+    assert.equal(result.url, "http://provider.test/static/task-1.png");
+    assert.deepEqual(requests[0].body, { prompt: "city skyline", image_size: "720p", samples: 1 });
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("z-image adapter accepts synchronous image responses without task id", async () => {
+  const previousFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({ data: [{ b64_json: "abc123" }] }), { status: 200 });
+
+    const result = await generateImageWithModel(
+      { enabled: true, baseUrl: "http://provider.test", timeoutSeconds: 1 },
+      { enabled: true, defaultParams: { n: 1 }, adapter: { kind: "z-image", submitPath: "/v1/images/generations" } },
+      { prompt: "portrait" },
+    );
+
+    assert.equal(result.providerTaskId, undefined);
+    assert.equal(result.url, "data:image/png;base64,abc123");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("z-image adapter retries transient task polling 404 responses", async () => {
+  const previousFetch = globalThis.fetch;
+  let pollCount = 0;
+  try {
+    globalThis.fetch = async (url) => {
+      if (String(url).endsWith("/v1/images/generations")) {
+        return new Response(JSON.stringify({ task_id: "task-404-once", status: "queued" }), { status: 200 });
+      }
+      pollCount += 1;
+      if (pollCount === 1) {
+        return new Response(JSON.stringify({ detail: "Task not found" }), { status: 404, statusText: "Not Found" });
+      }
+      return new Response(JSON.stringify({ status: "finished", data: [{ url: "/static/task-404-once.png" }] }), { status: 200 });
+    };
+
+    const result = await generateImageWithModel(
+      { enabled: true, baseUrl: "http://provider.test", timeoutSeconds: 1 },
+      {
+        enabled: true,
+        defaultParams: { n: 1 },
+        adapter: {
+          kind: "z-image-turbo",
+          submitPath: "/v1/images/generations",
+          taskPathTemplate: "/v1/images/tasks/{task_id}",
+          pollIntervalMs: 1,
+          taskNotFoundRetryMs: 100,
+          timeoutMs: 1000,
+        },
+      },
+      { prompt: "portrait" },
+    );
+
+    assert.equal(pollCount, 2);
+    assert.equal(result.url, "http://provider.test/static/task-404-once.png");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
 });
 
 test("collaboration service encodes and applies Yjs updates", () => {

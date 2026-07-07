@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { cancelTask, createModel, createProvider, getOverview, getTask, listModels, listProviders, listSystemEvents, listTasks, retryTask, retryTasksBatch, testProvider, updateModel, updateProvider } from "../api";
-import type { AdminOverview, AITask, ErrorCategory, NodeRuntimeStatus, SystemEventCategory, SystemEventLevel, SystemEventRecord, SystemEventSummary } from "../types";
+import { cancelTask, createModel, createProvider, createUser, deleteUser, getOverview, getTask, listModels, listProviders, listSystemEvents, listTasks, listUsers, retryTask, retryTasksBatch, syncSeedanceModels, testProvider, updateModel, updateProvider, updateUser } from "../api";
+import type { AdminOverview, AdminUser, AITask, ErrorCategory, NodeRuntimeStatus, SystemEventCategory, SystemEventLevel, SystemEventRecord, SystemEventSummary } from "../types";
 
 interface ParamSchemaEntry {
   key: string;
@@ -39,6 +39,21 @@ const MODEL_TYPES = [
   { value: "video", label: "视频模型", icon: "▶" },
 ];
 
+const MODEL_EDITOR_TABS = [
+  { value: "basic", label: "基本信息" },
+  { value: "defaults", label: "默认参数" },
+  { value: "schema", label: "参数 Schema" },
+  { value: "adapter", label: "适配器" },
+] as const;
+
+const ADAPTER_KIND_LABELS: Record<string, string> = {
+  "custom-http": "自定义 HTTP",
+  "z-image-turbo": "Z-Image Turbo",
+  "z-image": "Z-Image",
+  "seedance-video": "Seedance Video",
+  "sd-webui": "SD WebUI",
+};
+
 const DEFAULT_ADAPTER_CONFIG: AdapterConfig = {
   kind: "custom-http",
   submitMethod: "POST",
@@ -53,7 +68,7 @@ const DEFAULT_ADAPTER_CONFIG: AdapterConfig = {
   }, null, 2),
   taskIdPath: "task_id",
   pollMethod: "GET",
-  taskPathTemplate: "/v1/tasks/{task_id}",
+  taskPathTemplate: "/v1/images/tasks/{task_id}",
   pollingTemplate: "",
   statusPath: "status",
   successStatusValues: "finished, succeeded, success, completed, done",
@@ -230,6 +245,7 @@ function templateToString(value: unknown): string {
 }
 
 function defaultRequestTemplateForAdapter(kind: string, defaultParams?: Record<string, unknown>): string {
+  if (kind === "seedance-video") return "";
   if (kind === "z-image" || kind === "z-image-turbo" || kind === "custom-http") {
     const params = Object.keys(defaultParams || {});
     return JSON.stringify({
@@ -361,11 +377,14 @@ export function AdminPage() {
   const [providers, setProviders] = useState<Array<Record<string, unknown>>>([]);
   const [models, setModels] = useState<Array<Record<string, unknown>>>([]);
   const [tasks, setTasks] = useState<Record<string, unknown>[]>([]);
+  const [users, setUsers] = useState<AdminUser[]>([]);
   const [overview, setOverview] = useState<AdminOverview>(EMPTY_ADMIN_OVERVIEW);
   const [systemEvents, setSystemEvents] = useState<SystemEventRecord[]>([]);
   const [systemEventSummary, setSystemEventSummary] = useState<SystemEventSummary>(EMPTY_SYSTEM_EVENT_SUMMARY);
-  const [activeTab, setActiveTab] = useState<"overview" | "models" | "providers" | "tasks" | "logs">("overview");
+  const [activeTab, setActiveTab] = useState<"overview" | "users" | "models" | "providers" | "tasks" | "logs">("overview");
   const [activeModelType, setActiveModelType] = useState("image");
+  const [modelSearch, setModelSearch] = useState("");
+  const [modelEditorTab, setModelEditorTab] = useState<(typeof MODEL_EDITOR_TABS)[number]["value"]>("basic");
   const [editingModel, setEditingModel] = useState<Record<string, unknown> | null>(null);
   const [editingProvider, setEditingProvider] = useState<Record<string, unknown> | null>(null);
   const [adminNotice, setAdminNotice] = useState("");
@@ -374,8 +393,13 @@ export function AdminPage() {
   const [taskStatusFilter, setTaskStatusFilter] = useState<NodeRuntimeStatus | "">("");
   const [taskErrorFilter, setTaskErrorFilter] = useState<ErrorCategory | "">("");
   const [batchRetryLoading, setBatchRetryLoading] = useState(false);
+  const [seedanceSyncing, setSeedanceSyncing] = useState(false);
   const [eventLevelFilter, setEventLevelFilter] = useState<SystemEventLevel | "">("");
   const [eventCategoryFilter, setEventCategoryFilter] = useState<SystemEventCategory | "">("");
+  const [editingUser, setEditingUser] = useState<AdminUser | null>(null);
+  const [userSearch, setUserSearch] = useState("");
+  const [userRepairOnly, setUserRepairOnly] = useState(false);
+  const [userForm, setUserForm] = useState({ name: "", email: "", password: "", resetPassword: "" });
 
   // 供应商表单
   const [providerForm, setProviderForm] = useState({
@@ -411,11 +435,12 @@ export function AdminPage() {
     });
 
   const reloadAdmin = () =>
-    Promise.all([getOverview(), listProviders(), listModels(), listTasks(), reloadSystemEvents()]).then(([overviewResult, providerResult, modelResult, taskResult]) => {
+    Promise.all([getOverview(), listProviders(), listModels(), listTasks(), listUsers(), reloadSystemEvents()]).then(([overviewResult, providerResult, modelResult, taskResult, userResult]) => {
       setOverview(overviewResult.overview);
       setProviders(providerResult.providers);
       setModels(modelResult.models);
       setTasks(taskResult.tasks as unknown as Record<string, unknown>[]);
+      setUsers(userResult.users);
     });
 
   useEffect(() => {
@@ -425,6 +450,61 @@ export function AdminPage() {
   useEffect(() => {
     reloadSystemEvents().catch((error) => setAdminNotice(error instanceof Error ? error.message : "获取运行日志失败"));
   }, [eventLevelFilter, eventCategoryFilter]);
+
+  const resetUserForm = () => {
+    setEditingUser(null);
+    setUserForm({ name: "", email: "", password: "", resetPassword: "" });
+  };
+
+  const editUser = (user: AdminUser) => {
+    setEditingUser(user);
+    setUserForm({ name: user.name || "", email: user.email || "", password: "", resetPassword: "" });
+  };
+
+  const saveUser = async () => {
+    const name = userForm.name.trim();
+    const email = userForm.email.trim();
+    if (!name || !email) {
+      setAdminNotice("请输入用户名和邮箱");
+      return;
+    }
+    if (editingUser) {
+      const payload: { name: string; email: string; password?: string } = { name, email };
+      if (userForm.resetPassword) {
+        if (userForm.resetPassword.length < 6) {
+          setAdminNotice("重置密码至少需要 6 位");
+          return;
+        }
+        payload.password = userForm.resetPassword;
+      }
+      await updateUser(editingUser.id, payload);
+      setAdminNotice("用户已更新");
+    } else {
+      if (userForm.password.length < 6) {
+        setAdminNotice("初始密码至少需要 6 位");
+        return;
+      }
+      await createUser({ name, email, password: userForm.password });
+      setAdminNotice("用户已创建");
+    }
+    await reloadAdmin();
+    resetUserForm();
+  };
+
+  const handleDeleteUser = async () => {
+    if (!editingUser) return;
+    const label = editingUser.email || editingUser.name || editingUser.id;
+    if (!window.confirm(`确定删除用户「${label}」吗？此操作会清除该用户的登录会话和协作成员关系。`)) return;
+    try {
+      await deleteUser(editingUser.id);
+      setAdminNotice("用户已删除");
+      resetUserForm();
+      await reloadAdmin();
+    } catch (error) {
+      setAdminNotice(error instanceof Error ? error.message : "删除用户失败");
+    }
+  };
+
 
   // 供应商操作
   const saveProvider = async () => {
@@ -497,6 +577,7 @@ export function AdminPage() {
 
   const editModel = (model: Record<string, unknown>) => {
     setEditingModel(model);
+    setModelEditorTab("basic");
     setModelForm({
       id: String(model.id || ""),
       providerId: String(model.providerId || ""),
@@ -539,9 +620,9 @@ export function AdminPage() {
     });
   };
 
-  const resetModelForm = () => {
+  const resetModelForm = (nextType = activeModelType) => {
     setEditingModel(null);
-    setModelForm({ id: "", providerId: "", displayName: "", type: "image", capabilities: "text-to-image", enabled: true, sortOrder: 1 });
+    setModelForm({ id: "", providerId: "", displayName: "", type: nextType, capabilities: "text-to-image", enabled: true, sortOrder: 1 });
     setDefaultParams([]);
     setDefaultPublicParams([]);
     setParamSchema([]);
@@ -550,8 +631,9 @@ export function AdminPage() {
   };
 
   const startCreateModel = () => {
-    resetModelForm();
+    resetModelForm(activeModelType);
     setEditingModel({ displayName: "新模型" });
+    setModelEditorTab("basic");
     setModelForm((form) => ({ ...form, type: activeModelType }));
   };
 
@@ -561,9 +643,27 @@ export function AdminPage() {
     setAdminNotice(`模型已${model.enabled ? "禁用" : "启用"}`);
   };
 
+  const handleSyncSeedanceModels = async () => {
+    setSeedanceSyncing(true);
+    try {
+      const result = await syncSeedanceModels();
+      await reloadAdmin();
+      setActiveModelType("video");
+      setAdminNotice(`已同步 ${result.models.length} 个 Seedance 视频模型`);
+    } catch (error) {
+      setAdminNotice(error instanceof Error ? error.message : "Seedance 视频模型同步失败");
+    } finally {
+      setSeedanceSyncing(false);
+    }
+  };
+
   const handleTestProvider = async (provider: Record<string, unknown>) => {
-    const result = await testProvider(String(provider.id));
-    setAdminNotice(`${String(provider.name)}：${result.message}${result.latencyMs ? `（${result.latencyMs}ms）` : ""}`);
+    try {
+      const result = await testProvider(String(provider.id));
+      setAdminNotice(`${String(provider.name)}：${result.message}${result.latencyMs ? `（${result.latencyMs}ms）` : ""}`);
+    } catch (error) {
+      setAdminNotice(error instanceof Error ? error.message : "供应商测试失败");
+    }
   };
 
   const handleCancelTask = async (task: Record<string, unknown>) => {
@@ -734,6 +834,44 @@ export function AdminPage() {
     })));
   };
 
+  const providerById = new Map(providers.map((provider) => [String(provider.id || ""), provider]));
+  const normalizedUserSearch = userSearch.trim().toLowerCase();
+  const filteredUsers = users.filter((user) => {
+    if (userRepairOnly && user.email && user.hasPassword) return false;
+    if (!normalizedUserSearch) return true;
+    return [user.name, user.email, user.id]
+      .map((value) => String(value || "").toLowerCase())
+      .some((value) => value.includes(normalizedUserSearch));
+  });
+  const usersWithEmailCount = users.filter((user) => Boolean(user.email)).length;
+  const usersWithPasswordCount = users.filter((user) => user.hasPassword).length;
+  const loginReadyUserCount = users.filter((user) => user.email && user.hasPassword).length;
+  const repairUserCount = users.length - loginReadyUserCount;
+  const currentTypeModels = models
+    .filter((model) => model.type === activeModelType)
+    .sort((a, b) => Number(a.sortOrder || 100) - Number(b.sortOrder || 100));
+  const normalizedModelSearch = modelSearch.trim().toLowerCase();
+  const filteredModels = currentTypeModels.filter((model) => {
+    if (!normalizedModelSearch) return true;
+    const haystack = [
+      model.id,
+      model.displayName,
+      model.providerId,
+      Array.isArray(model.capabilities) ? model.capabilities.join(" ") : "",
+      (model.adapter as Record<string, unknown> | undefined)?.kind,
+    ].map((value) => String(value || "").toLowerCase()).join(" ");
+    return haystack.includes(normalizedModelSearch);
+  });
+  const enabledModelCount = currentTypeModels.filter((model) => model.enabled !== false).length;
+  const missingProviderCount = currentTypeModels.filter((model) => !providerById.has(String(model.providerId || ""))).length;
+  const disabledProviderCount = currentTypeModels.filter((model) => {
+    const provider = providerById.get(String(model.providerId || ""));
+    return provider && provider.enabled === false;
+  }).length;
+  const selectedProvider = providerById.get(modelForm.providerId);
+  const selectedTypeLabel = MODEL_TYPES.find((type) => type.value === activeModelType)?.label || "模型";
+  const selectedAdapterLabel = ADAPTER_KIND_LABELS[adapterConfig.kind] || adapterConfig.kind || "-";
+
   return (
     <div className="admin-page">
       <header className="topbar">
@@ -747,6 +885,7 @@ export function AdminPage() {
       {/* 标签页导航 */}
       <nav className="admin-tabs">
         <button className={activeTab === "overview" ? "active" : ""} onClick={() => setActiveTab("overview")}>运维概览</button>
+        <button className={activeTab === "users" ? "active" : ""} onClick={() => setActiveTab("users")}>用户管理</button>
         <button className={activeTab === "models" ? "active" : ""} onClick={() => setActiveTab("models")}>模型管理</button>
         <button className={activeTab === "providers" ? "active" : ""} onClick={() => setActiveTab("providers")}>供应商</button>
         <button className={activeTab === "tasks" ? "active" : ""} onClick={() => setActiveTab("tasks")}>任务记录</button>
@@ -937,162 +1076,449 @@ export function AdminPage() {
         </section>
       )}
 
+
+      {activeTab === "users" && (
+        <section className="admin-section user-management-grid">
+          <div className="user-list-panel">
+            <div className="user-admin-header">
+              <div>
+                <h2>用户管理</h2>
+                <span>排查邮箱、密码哈希和用户资产归属，缺密码的账号需要重置后才能登录。</span>
+              </div>
+              <div className="user-admin-actions">
+                <button className="weui-btn weui-btn_mini weui-btn_default" onClick={() => reloadAdmin()}>刷新</button>
+                <button className="weui-btn weui-btn_mini weui-btn_primary" onClick={resetUserForm}>新增用户</button>
+              </div>
+            </div>
+
+            <div className="user-stats-strip">
+              <span><strong>{users.length}</strong> 全部用户</span>
+              <span><strong>{loginReadyUserCount}</strong> 可登录</span>
+              <span className={users.length - usersWithEmailCount ? "is-warning" : ""}><strong>{users.length - usersWithEmailCount}</strong> 缺邮箱</span>
+              <span className={users.length - usersWithPasswordCount ? "is-danger" : ""}><strong>{users.length - usersWithPasswordCount}</strong> 缺密码</span>
+            </div>
+
+            <div className="user-repair-banner">
+              <div>
+                <strong>{repairUserCount ? `发现 ${repairUserCount} 个账号需要修复` : "所有账号均可登录"}</strong>
+                <span>旧数据如果缺少邮箱或密码哈希，无法用原邮箱密码登录；需要在这里补邮箱并重置一次密码。</span>
+              </div>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={userRepairOnly}
+                  onChange={(event) => setUserRepairOnly(event.target.checked)}
+                />
+                只看需修复
+              </label>
+            </div>
+
+            <div className="user-toolbar">
+              <label className="user-search-field">
+                <span>搜索用户</span>
+                <input
+                  value={userSearch}
+                  onChange={(event) => setUserSearch(event.target.value)}
+                  placeholder="用户名、邮箱或用户 ID"
+                />
+              </label>
+            </div>
+
+            <div className="user-table">
+              <div className="user-table-head">
+                <span>用户</span>
+                <span>登录状态</span>
+                <span>资产</span>
+                <span>最近更新</span>
+              </div>
+              {filteredUsers.map((user) => {
+                const loginReady = Boolean(user.email && user.hasPassword);
+                return (
+                  <button
+                    key={user.id}
+                    type="button"
+                    className={editingUser?.id === user.id ? "user-row active" : "user-row"}
+                    onClick={() => editUser(user)}
+                  >
+                    <span className="user-identity-cell">
+                      <strong>{user.name || user.email || user.id}</strong>
+                      <small>{user.email || "缺少邮箱"} · {user.id}</small>
+                    </span>
+                    <span className="user-status-cell">
+                      <i className={loginReady ? "user-status-ok" : "user-status-bad"}>{loginReady ? "可登录" : "需修复"}</i>
+                      {!user.hasPassword && <em>缺密码</em>}
+                      {!user.email && <em>缺邮箱</em>}
+                    </span>
+                    <span>{user.projectCount || 0} 项目 / {user.ownedCanvasCount || 0} 画布 / {user.sharedCanvasCount || 0} 协作</span>
+                    <span>{formatDateTime(user.updatedAt)}</span>
+                  </button>
+                );
+              })}
+              {!filteredUsers.length && <div className="overview-empty">暂无匹配用户</div>}
+            </div>
+          </div>
+
+          <div className="edit-panel user-edit-panel">
+            <h3>{editingUser ? "编辑用户" : "新增用户"}</h3>
+            {editingUser && (!editingUser.email || !editingUser.hasPassword) && (
+              <div className="user-fix-callout">
+                <strong>该账号当前不能正常登录</strong>
+                <span>
+                  {!editingUser.email && "请补全邮箱。"}
+                  {!editingUser.hasPassword && " 请设置新的登录密码。"}
+                  {" "}旧密码哈希无法反推，只能重置。
+                </span>
+              </div>
+            )}
+            <div className="form-grid">
+              <div className="form-group">
+                <label>用户名</label>
+                <input value={userForm.name} onChange={(event) => setUserForm({ ...userForm, name: event.target.value })} />
+              </div>
+              <div className="form-group">
+                <label>邮箱</label>
+                <input value={userForm.email} onChange={(event) => setUserForm({ ...userForm, email: event.target.value })} />
+              </div>
+              {!editingUser && (
+                <div className="form-group">
+                  <label>初始密码</label>
+                  <input type="password" value={userForm.password} onChange={(event) => setUserForm({ ...userForm, password: event.target.value })} />
+                </div>
+              )}
+              {editingUser && (
+                <div className="form-group full-span">
+                  <label>重置密码</label>
+                  <input
+                    type="password"
+                    value={userForm.resetPassword}
+                    onChange={(event) => setUserForm({ ...userForm, resetPassword: event.target.value })}
+                    placeholder={editingUser.hasPassword ? "留空则不修改密码" : "该用户缺少密码哈希，请设置新密码"}
+                  />
+                </div>
+              )}
+            </div>
+            {editingUser && (
+              <div className="user-meta-grid">
+                <span>用户 ID：{editingUser.id}</span>
+                <span>登录状态：{editingUser.email && editingUser.hasPassword ? "可登录" : "需修复邮箱或密码"}</span>
+                <span>创建时间：{formatDateTime(editingUser.createdAt)}</span>
+                <span>更新时间：{formatDateTime(editingUser.updatedAt)}</span>
+              </div>
+            )}
+            <div className="button-row">
+              <button className="weui-btn weui-btn_primary" onClick={saveUser}>{editingUser ? "保存用户" : "创建用户"}</button>
+              <button className="weui-btn weui-btn_default" onClick={resetUserForm}>清空</button>
+              {editingUser && <button className="weui-btn weui-btn_warn" onClick={handleDeleteUser}>删除用户</button>}
+            </div>
+          </div>
+        </section>
+      )}
+
       {activeTab === "models" && (
-        <section className="admin-section">
-          {/* 模型类型切换 */}
-          <div className="model-type-tabs">
+        <section className="admin-section model-admin-section">
+          <div className="model-admin-header">
+            <div>
+              <h2>模型管理</h2>
+              <span>统一维护模型启用状态、前端公开参数、内部默认值和供应商适配器</span>
+            </div>
+            <div className="model-admin-actions">
+              <button className="weui-btn weui-btn_mini weui-btn_default" onClick={() => reloadAdmin()}>刷新</button>
+              <button className="weui-btn weui-btn_mini weui-btn_primary" onClick={startCreateModel}>新增模型</button>
+            </div>
+          </div>
+
+          <div className="model-command-bar">
+            <label className="model-search-field">
+              <span>搜索模型</span>
+              <input
+                value={modelSearch}
+                onChange={(event) => setModelSearch(event.target.value)}
+                placeholder="名称、ID、供应商、能力或适配器"
+              />
+            </label>
+            <div className="model-type-tabs" role="tablist" aria-label="模型类型">
             {MODEL_TYPES.map((type) => (
               <button
                 key={type.value}
+                type="button"
                 className={activeModelType === type.value ? "active" : ""}
-                onClick={() => setActiveModelType(type.value)}
+                onClick={() => {
+                  setActiveModelType(type.value);
+                  setModelSearch("");
+                  resetModelForm(type.value);
+                }}
               >
                 <span className="type-icon">{type.icon}</span>
                 <span>{type.label}</span>
                 <span className="type-count">{models.filter((m) => m.type === type.value).length}</span>
               </button>
             ))}
-          </div>
-
-          {/* 模型列表 */}
-          <div className="model-grid">
-            {models
-              .filter((m) => m.type === activeModelType)
-              .sort((a, b) => Number(a.sortOrder || 100) - Number(b.sortOrder || 100))
-              .map((model) => (
-                <div
-                  key={String(model.id)}
-                  className={`model-card ${model.enabled ? "enabled" : "disabled"} ${editingModel?.id === model.id ? "editing" : ""}`}
-                >
-                  <div className="model-card-header">
-                    <strong>{String(model.displayName)}</strong>
-                    <button
-                      className={`toggle-btn ${model.enabled ? "on" : "off"}`}
-                      onClick={() => toggleModelEnabled(model)}
-                      title={model.enabled ? "点击禁用" : "点击启用"}
-                    >
-                      {model.enabled ? "启用" : "禁用"}
-                    </button>
-                  </div>
-                  <div className="model-card-body">
-                    <span className="model-id">{String(model.id)}</span>
-                    <span className="model-provider">{String(model.providerId)}</span>
-                    <div className="model-capabilities">
-                      {Array.isArray(model.capabilities) && model.capabilities.map((cap: string) => (
-                        <span key={cap} className="capability-tag">{cap}</span>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="model-card-footer">
-                    <button className="weui-btn weui-btn_mini weui-btn_default" onClick={() => editModel(model)}>
-                      编辑配置
-                    </button>
-                  </div>
-                </div>
-              ))}
-            <div className="model-card add-card" onClick={startCreateModel}>
-              <span className="add-icon">+</span>
-              <span>添加{MODEL_TYPES.find((t) => t.value === activeModelType)?.label}</span>
             </div>
           </div>
 
-          {/* 模型编辑表单 */}
-          {editingModel !== null && (
-            <div className="edit-panel">
-              <h3>编辑模型: {String(editingModel.displayName)}</h3>
-              <div className="form-grid">
-                <div className="form-group">
-                  <label>模型 ID</label>
-                  <input value={modelForm.id} disabled />
+          {activeModelType === "video" && (
+            <div className="model-preset-toolbar">
+              <div>
+                <strong>Seedance 2.0 视频模型</strong>
+                <span>同步火山方舟供应商和 Seedance 2.0 / Fast 两个模型配置</span>
+              </div>
+              <button className="weui-btn weui-btn_primary" disabled={seedanceSyncing} onClick={handleSyncSeedanceModels}>
+                {seedanceSyncing ? "同步中..." : "同步 Seedance 2.0"}
+              </button>
+            </div>
+          )}
+
+          <div className="model-stats-strip">
+            <span><strong>{currentTypeModels.length}</strong> 当前类型</span>
+            <span><strong>{enabledModelCount}</strong> 已启用</span>
+            <span className={missingProviderCount || disabledProviderCount ? "is-warning" : ""}>
+              <strong>{missingProviderCount + disabledProviderCount}</strong> 供应商异常
+            </span>
+            <span><strong>{filteredModels.length}</strong> 筛选结果</span>
+          </div>
+
+          <div className="model-workbench">
+            <aside className="model-list-panel">
+              <div className="model-list-header">
+                <div>
+                  <strong>{selectedTypeLabel}</strong>
+                  <span>{modelSearch ? `匹配 ${filteredModels.length} / ${currentTypeModels.length}` : `共 ${currentTypeModels.length} 个`}</span>
                 </div>
-                <div className="form-group">
-                  <label>显示名称</label>
-                  <input value={modelForm.displayName} onChange={(event) => setModelForm({ ...modelForm, displayName: event.target.value })} />
+                {modelSearch && <button type="button" onClick={() => setModelSearch("")}>清除</button>}
+              </div>
+              <div className="model-list-table">
+                <div className="model-table-head">
+                  <span>模型</span>
+                  <span>供应商</span>
+                  <span>适配器</span>
+                  <span>状态</span>
                 </div>
-                <div className="form-group">
-                  <label>供应商</label>
-                  <select value={modelForm.providerId} onChange={(event) => setModelForm({ ...modelForm, providerId: event.target.value })}>
-                    <option value="">选择供应商</option>
-                    {providers.filter((p) => p.enabled !== false).map((p) => (
-                      <option key={String(p.id)} value={String(p.id)}>{String(p.name)}</option>
+                {filteredModels.map((model) => {
+                  const provider = providerById.get(String(model.providerId || ""));
+                  const adapterKind = String((model.adapter as Record<string, unknown> | undefined)?.kind || "-");
+                  return (
+                    <div
+                      key={String(model.id)}
+                      className={`model-list-row ${model.enabled !== false ? "enabled" : "disabled"} ${editingModel?.id === model.id ? "selected" : ""}`}
+                      onClick={() => editModel(model)}
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") editModel(model);
+                      }}
+                    >
+                      <span className="model-name-cell">
+                        <strong>{String(model.displayName || model.id)}</strong>
+                        <code>{String(model.id)}</code>
+                      </span>
+                      <span className={provider && provider.enabled === false ? "model-provider-warning" : ""}>
+                        {provider ? String(provider.name || provider.id) : "未找到供应商"}
+                      </span>
+                      <span>{ADAPTER_KIND_LABELS[adapterKind] || adapterKind}</span>
+                      <span className="model-state-cell">
+                        <button
+                          className={`toggle-btn ${model.enabled !== false ? "on" : "off"}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            toggleModelEnabled(model);
+                          }}
+                          title={model.enabled !== false ? "点击禁用" : "点击启用"}
+                        >
+                          {model.enabled !== false ? "启用" : "禁用"}
+                        </button>
+                      </span>
+                    </div>
+                  );
+                })}
+                {!filteredModels.length && (
+                  <div className="model-empty-state">
+                    <strong>没有匹配的模型</strong>
+                    <span>调整搜索条件，或新增一个{selectedTypeLabel}。</span>
+                    <button className="weui-btn weui-btn_mini weui-btn_primary" onClick={startCreateModel}>新增模型</button>
+                  </div>
+                )}
+              </div>
+            </aside>
+
+            <div className="model-detail-panel">
+              {editingModel === null ? (
+                <div className="model-detail-empty">
+                  <strong>选择左侧模型开始编辑</strong>
+                  <span>模型列表和编辑区并排展示，避免在长表单中丢失上下文。</span>
+                  <button className="weui-btn weui-btn_primary" onClick={startCreateModel}>新增{selectedTypeLabel}</button>
+                </div>
+              ) : (
+                <>
+                  <div className="model-detail-header">
+                    <div>
+                      <span>{modelForm.type || activeModelType}</span>
+                      <h3>{modelForm.displayName || "新模型"}</h3>
+                      <code>{modelForm.id || "保存时自动生成 ID"}</code>
+                    </div>
+                    <div className="model-detail-actions">
+                      <button className="weui-btn weui-btn_mini weui-btn_primary" onClick={saveModel}>保存配置</button>
+                      <button className="weui-btn weui-btn_mini weui-btn_default" onClick={() => resetModelForm()}>取消</button>
+                    </div>
+                  </div>
+                  <div className="model-editor-tabs">
+                    {MODEL_EDITOR_TABS.map((tab) => (
+                      <button
+                        key={tab.value}
+                        type="button"
+                        className={modelEditorTab === tab.value ? "active" : ""}
+                        onClick={() => setModelEditorTab(tab.value)}
+                      >
+                        {tab.label}
+                      </button>
                     ))}
-                  </select>
-                </div>
-                <div className="form-group">
-                  <label>能力（逗号分隔）</label>
-                  <input value={modelForm.capabilities} onChange={(event) => setModelForm({ ...modelForm, capabilities: event.target.value })} placeholder="text-to-image, image-to-image" />
-                </div>
-                <div className="form-group">
-                  <label>排序权重</label>
-                  <input type="number" value={modelForm.sortOrder} onChange={(event) => setModelForm({ ...modelForm, sortOrder: Number(event.target.value) })} />
-                </div>
-              </div>
+                  </div>
 
-              <h4>内部默认参数</h4>
-              {defaultParams.map((entry, index) => (
-                <div key={index} className="param-row">
-                  <input value={entry.key} onChange={(event) => updateParamEntry(setDefaultParams, index, "key", event.target.value)} placeholder="参数名" />
-                  <input value={entry.values} onChange={(event) => updateParamEntry(setDefaultParams, index, "values", event.target.value)} placeholder="默认值" />
-                  <button className="remove-btn" onClick={() => removeParamEntry(setDefaultParams, index)}>×</button>
-                </div>
-              ))}
-              <button className="add-param-btn" onClick={() => addParamEntry(setDefaultParams)}>+ 添加内部默认参数</button>
+                  <div className="model-editor-body">
+                    {modelEditorTab === "basic" && (
+                      <div className="model-editor-section">
+                        <div className="model-section-title">
+                          <h4>基础配置</h4>
+                          <span>这些字段决定前端是否能找到模型、属于哪类能力，以及排序优先级。</span>
+                        </div>
+                        <div className="form-grid">
+                          <div className="form-group">
+                            <label>模型 ID</label>
+                            <input value={modelForm.id} disabled />
+                          </div>
+                          <div className="form-group">
+                            <label>显示名称</label>
+                            <input value={modelForm.displayName} onChange={(event) => setModelForm({ ...modelForm, displayName: event.target.value })} />
+                          </div>
+                          <div className="form-group">
+                            <label>模型类型</label>
+                            <select value={modelForm.type} onChange={(event) => setModelForm({ ...modelForm, type: event.target.value })}>
+                              {MODEL_TYPES.map((type) => (
+                                <option key={type.value} value={type.value}>{type.label}</option>
+                              ))}
+                            </select>
+                          </div>
+                          <div className="form-group">
+                            <label>供应商</label>
+                            <select value={modelForm.providerId} onChange={(event) => setModelForm({ ...modelForm, providerId: event.target.value })}>
+                              <option value="">选择供应商</option>
+                              {providers.map((p) => (
+                                <option key={String(p.id)} value={String(p.id)}>{String(p.name)}{p.enabled === false ? "（已禁用）" : ""}</option>
+                              ))}
+                            </select>
+                          </div>
+                          <div className="form-group">
+                            <label>能力（逗号分隔）</label>
+                            <input value={modelForm.capabilities} onChange={(event) => setModelForm({ ...modelForm, capabilities: event.target.value })} placeholder="text-to-image, image-to-image" />
+                          </div>
+                          <div className="form-group">
+                            <label>排序权重</label>
+                            <input type="number" value={modelForm.sortOrder} onChange={(event) => setModelForm({ ...modelForm, sortOrder: Number(event.target.value) })} />
+                          </div>
+                        </div>
+                        <div className="model-summary-grid">
+                          <span><strong>启用状态</strong><label><input type="checkbox" checked={modelForm.enabled} onChange={(event) => setModelForm({ ...modelForm, enabled: event.target.checked })} /> 前端可用</label></span>
+                          <span><strong>供应商状态</strong>{selectedProvider ? (selectedProvider.enabled === false ? "供应商已禁用" : "供应商已启用") : "未选择供应商"}</span>
+                          <span><strong>当前适配器</strong>{selectedAdapterLabel}</span>
+                        </div>
+                      </div>
+                    )}
 
-              <div className="param-heading-row">
-                <h4>客户公开默认参数</h4>
-                <button type="button" onClick={() => syncDefaultsFromSchema(setDefaultPublicParams, publicParamSchema)}>
-                  从公开 Schema 生成默认值
-                </button>
-              </div>
-              {defaultPublicParams.map((entry, index) => (
-                <div key={index} className="param-row public-param-row">
-                  <input value={entry.key} onChange={(event) => updateParamEntry(setDefaultPublicParams, index, "key", event.target.value)} placeholder="客户可见参数名" />
-                  <input value={entry.values} onChange={(event) => updateParamEntry(setDefaultPublicParams, index, "values", event.target.value)} placeholder="客户侧默认值" />
-                  <button className="remove-btn" onClick={() => removeParamEntry(setDefaultPublicParams, index)}>×</button>
-                </div>
-              ))}
-              <button className="add-param-btn public-add-param-btn" onClick={() => addParamEntry(setDefaultPublicParams)}>+ 添加公开默认参数</button>
+                    {modelEditorTab === "defaults" && (
+                      <div className="model-editor-section">
+                        <div className="model-section-title">
+                          <h4>默认参数</h4>
+                          <span>内部默认值用于实际请求，公开默认值用于前端面板展示。公开参数为空时前端不会显示对应控制项。</span>
+                        </div>
+                        <div className="model-param-columns">
+                          <div className="model-param-panel">
+                            <div className="param-heading-row">
+                              <h4>内部默认参数</h4>
+                            </div>
+                            {defaultParams.map((entry, index) => (
+                              <div key={index} className="param-row">
+                                <input value={entry.key} onChange={(event) => updateParamEntry(setDefaultParams, index, "key", event.target.value)} placeholder="参数名" />
+                                <input value={entry.values} onChange={(event) => updateParamEntry(setDefaultParams, index, "values", event.target.value)} placeholder="默认值" />
+                                <button className="remove-btn" onClick={() => removeParamEntry(setDefaultParams, index)}>×</button>
+                              </div>
+                            ))}
+                            <button className="add-param-btn" onClick={() => addParamEntry(setDefaultParams)}>+ 添加内部默认参数</button>
+                          </div>
+                          <div className="model-param-panel public-param-panel">
+                            <div className="param-heading-row">
+                              <h4>客户公开默认参数</h4>
+                              <button type="button" onClick={() => syncDefaultsFromSchema(setDefaultPublicParams, publicParamSchema)}>
+                                从公开 Schema 生成
+                              </button>
+                            </div>
+                            {defaultPublicParams.map((entry, index) => (
+                              <div key={index} className="param-row public-param-row">
+                                <input value={entry.key} onChange={(event) => updateParamEntry(setDefaultPublicParams, index, "key", event.target.value)} placeholder="客户可见参数名" />
+                                <input value={entry.values} onChange={(event) => updateParamEntry(setDefaultPublicParams, index, "values", event.target.value)} placeholder="客户侧默认值" />
+                                <button className="remove-btn" onClick={() => removeParamEntry(setDefaultPublicParams, index)}>×</button>
+                              </div>
+                            ))}
+                            <button className="add-param-btn public-add-param-btn" onClick={() => addParamEntry(setDefaultPublicParams)}>+ 添加公开默认参数</button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
 
-              <h4>内部参数 Schema</h4>
-              {paramSchema.map((entry, index) => (
-                <ParamSchemaRow
-                  key={index}
-                  entry={entry}
-                  index={index}
-                  onUpdate={setParamSchema}
-                  updateParamEntry={updateParamEntry}
-                  removeParamEntry={removeParamEntry}
-                />
-              ))}
-              <button className="add-param-btn" onClick={() => addParamEntry(setParamSchema)}>+ 添加内部参数 Schema</button>
+                    {modelEditorTab === "schema" && (
+                      <div className="model-editor-section">
+                        <div className="model-section-title">
+                          <h4>参数 Schema</h4>
+                          <span>Schema 控制参数类型、控件形式、可选值和是否向前端公开。</span>
+                        </div>
+                        <div className="param-heading-row">
+                          <h4>内部参数 Schema</h4>
+                        </div>
+                        {paramSchema.map((entry, index) => (
+                          <ParamSchemaRow
+                            key={index}
+                            entry={entry}
+                            index={index}
+                            onUpdate={setParamSchema}
+                            updateParamEntry={updateParamEntry}
+                            removeParamEntry={removeParamEntry}
+                          />
+                        ))}
+                        <button className="add-param-btn" onClick={() => addParamEntry(setParamSchema)}>+ 添加内部参数 Schema</button>
 
-              <div className="param-heading-row">
-                <h4>客户公开参数 Schema</h4>
-                <button type="button" onClick={() => setPublicParamSchema(paramSchema.map((entry) => createParamEntry({ ...entry, publicVisible: true })))}>
-                  从内部 Schema 同步
-                </button>
-              </div>
-              {publicParamSchema.map((entry, index) => (
-                <ParamSchemaRow
-                  key={index}
-                  entry={entry}
-                  index={index}
-                  publicRow
-                  onUpdate={setPublicParamSchema}
-                  updateParamEntry={updateParamEntry}
-                  removeParamEntry={removeParamEntry}
-                />
-              ))}
-              <button className="add-param-btn public-add-param-btn" onClick={() => addParamEntry(setPublicParamSchema)}>+ 添加公开参数 Schema</button>
+                        <div className="param-heading-row">
+                          <h4>客户公开参数 Schema</h4>
+                          <button type="button" onClick={() => setPublicParamSchema(paramSchema.map((entry) => createParamEntry({ ...entry, publicVisible: true })))}>
+                            从内部 Schema 同步
+                          </button>
+                        </div>
+                        {publicParamSchema.map((entry, index) => (
+                          <ParamSchemaRow
+                            key={index}
+                            entry={entry}
+                            index={index}
+                            publicRow
+                            onUpdate={setPublicParamSchema}
+                            updateParamEntry={updateParamEntry}
+                            removeParamEntry={removeParamEntry}
+                          />
+                        ))}
+                        <button className="add-param-btn public-add-param-btn" onClick={() => addParamEntry(setPublicParamSchema)}>+ 添加公开参数 Schema</button>
+                      </div>
+                    )}
 
-              <h4>适配器配置</h4>
-              <div className="form-grid">
+                    {modelEditorTab === "adapter" && (
+                      <div className="model-editor-section">
+                        <div className="model-section-title">
+                          <h4>适配器配置</h4>
+                          <span>定义提交、轮询、状态映射和结果字段路径。Seedance 视频模型使用内置视频适配器。</span>
+                        </div>
+                        <div className="form-grid">
                 <div className="form-group">
                   <label>适配器类型</label>
                   <select value={adapterConfig.kind} onChange={(event) => setAdapterConfig({ ...adapterConfig, kind: event.target.value })}>
                     <option value="custom-http">自定义 HTTP</option>
                     <option value="z-image-turbo">Z-Image Turbo</option>
                     <option value="z-image">Z-Image</option>
+                    <option value="seedance-video">Seedance Video</option>
                     <option value="sd-webui">SD WebUI</option>
                   </select>
                 </div>
@@ -1133,7 +1559,7 @@ export function AdminPage() {
                 </div>
                 <div className="form-group">
                   <label>查询任务路径模板</label>
-                  <input value={adapterConfig.taskPathTemplate} onChange={(event) => setAdapterConfig({ ...adapterConfig, taskPathTemplate: event.target.value })} placeholder="/v1/tasks/{task_id}" />
+                  <input value={adapterConfig.taskPathTemplate} onChange={(event) => setAdapterConfig({ ...adapterConfig, taskPathTemplate: event.target.value })} placeholder="/v1/images/tasks/{task_id}" />
                 </div>
                 <div className="form-group full-span">
                   <label>轮询请求体模板</label>
@@ -1178,12 +1604,13 @@ export function AdminPage() {
                 </div>
               </div>
 
-              <div className="button-row">
-                <button className="weui-btn weui-btn_primary" onClick={saveModel}>保存配置</button>
-                <button className="weui-btn weui-btn_default" onClick={resetModelForm}>取消</button>
-              </div>
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
             </div>
-          )}
+          </div>
         </section>
       )}
 

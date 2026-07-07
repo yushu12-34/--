@@ -86,7 +86,21 @@ export const nodeDefinitions: NodeDefinition[] = [
       { id: "in", name: "输入", direction: "input", mediaType: "text", accepts: ["text", "image", "video", "audio"], required: true, multiple: true },
     ],
     outputs: [{ id: "out", name: "输出", direction: "output", mediaType: "video" }],
-    defaultData: { duration: 5, fps: 24, resultUrl: "" },
+    defaultData: {
+      modelId: "seedance-2-fast",
+      duration: 5,
+      fps: 24,
+      resultUrl: "",
+      params: {
+        resolution: "720p",
+        ratio: "adaptive",
+        duration: 5,
+        generate_audio: true,
+        watermark: false,
+        web_search: false,
+        priority: 0,
+      },
+    },
     configurable: true,
   },
 ];

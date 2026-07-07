@@ -107,6 +107,7 @@ export interface ProjectRecord {
 export interface UserRecord {
   id: string;
   name: string;
+  email?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -126,6 +127,29 @@ export interface CanvasMemberRecord {
   userId: string;
   role: "owner" | "editor" | "viewer";
   addedAt: string;
+  userName?: string;
+  userEmail?: string;
+}
+
+export interface CanvasAccessRecord {
+  exists: boolean;
+  allowed: boolean;
+  role: "owner" | "editor" | "viewer";
+  canvasId: string;
+  projectId: string;
+  ownerId: string;
+}
+
+export interface CollaborativeCanvasRecord {
+  canvas: CanvasRecord;
+  role: "editor" | "viewer";
+  addedAt?: string;
+  projectName?: string;
+  owner?: {
+    id: string;
+    name: string;
+    email?: string;
+  };
 }
 
 export interface YjsSnapshotRecord {

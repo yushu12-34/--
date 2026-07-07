@@ -91,7 +91,7 @@ npm run preflight
 
 ```env
 DATA_BACKEND=postgres
-DATABASE_URL=postgresql://anime_canvas_app:真实密码@服务器局域网IP:5432/anime_canvas
+DATABASE_URL=postgresql://anime_canvas_app:真实密码@服务器局域网IP:5433/anime_canvas
 USER_FINGERPRINT_SECRET=至少32字节随机密钥
 ```
 
@@ -110,7 +110,7 @@ $env:POSTGRES_DRY_RUN_STRICT="true"; npm run postgres:dry-run
 验证本机后端到服务器 PostgreSQL 的局域网连通性：
 
 ```powershell
-$env:DATABASE_URL="postgresql://anime_canvas_app:真实密码@服务器局域网IP:5432/anime_canvas"; npm run postgres:smoke
+$env:DATABASE_URL="postgresql://anime_canvas_app:真实密码@服务器局域网IP:5433/anime_canvas"; npm run postgres:smoke
 ```
 
 正式迁移采用双保险命令：默认演练不写库，只有带 `--apply --confirm replace-postgres` 才会替换 PostgreSQL，并在写入前备份当前 PostgreSQL 快照：

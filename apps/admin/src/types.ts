@@ -55,6 +55,19 @@ export interface SystemEventSummary {
   latestWarningAt: string | null;
 }
 
+export interface AdminUser {
+  id: string;
+  name: string;
+  email?: string;
+  hasPassword?: boolean;
+  createdAt: string;
+  updatedAt: string;
+  lastSeenAt?: string;
+  projectCount?: number;
+  ownedCanvasCount?: number;
+  sharedCanvasCount?: number;
+}
+
 export interface AdminOverview {
   generatedAt: string;
   tasks: {

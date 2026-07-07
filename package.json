@@ -5,9 +5,9 @@
   "scripts": {
     "setup": "powershell -ExecutionPolicy Bypass -File scripts/setup-local.ps1",
     "dev": "powershell -ExecutionPolicy Bypass -File scripts/start-local.ps1",
-    "dev:api": "npm --prefix apps/api run dev",
-    "dev:web": "npm --prefix apps/web run dev -- --port 5180",
-    "dev:admin": "npm --prefix apps/admin run dev -- --port 5190",
+    "dev:api": "node scripts/run-with-root-env.mjs npm --prefix apps/api run dev",
+    "dev:web": "node scripts/run-with-root-env.mjs npm --prefix apps/web run dev -- --port 5180",
+    "dev:admin": "node scripts/run-with-root-env.mjs npm --prefix apps/admin run dev -- --port 5190",
     "stop": "powershell -ExecutionPolicy Bypass -File scripts/stop-local.ps1",
     "build": "npm --prefix apps/web run build && npm --prefix apps/admin run build",
     "test": "node --experimental-strip-types --experimental-specifier-resolution=node --test tests/*.mjs",

@@ -1,16 +1,18 @@
 import crypto from "node:crypto";
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import * as Y from "yjs";
-import { readJson } from "../db.js";
+import { getCanvasAccess, getCanvasYjsPersistenceDirect, getUserByAuthTokenHash, readJson } from "../db.js";
+import { hashToken } from "./authService.js";
 import {
+  buildYDocFromPersistence,
   decodeYUpdate,
   encodeYUpdate,
   getCanvasYjsSnapshotDetail,
   listCanvasYjsSnapshots,
   persistYjsUpdate,
-  restoreYDocFromDb,
   saveYjsSnapshot,
 } from "./yjsPersistenceService.js";
+import { getBroadcastAdapter, setLocalBroadcast } from "./broadcastAdapter.js";
 
 export { decodeYUpdate, encodeYUpdate } from "./yjsPersistenceService.js";
 
@@ -81,26 +83,96 @@ function hasSnapshotContent(snapshot) {
   );
 }
 
-function broadcast(room, payload, exceptSocket) {
+function broadcast(room, payload, exceptSocket, canvasId) {
   const message = JSON.stringify(payload);
   for (const client of room.values()) {
-    if (client.socket === exceptSocket || client.socket.readyState !== client.socket.OPEN) continue;
+    if (client.socket === exceptSocket || client.socket.readyState !== WebSocket.OPEN) continue;
     client.socket.send(message);
+  }
+  // 跨实例广播：publish 到 Redis（若配置），让其他 API 实例的客户端也能收到
+  if (canvasId) {
+    getBroadcastAdapter().publish(canvasId, payload).catch(() => {});
+  }
+}
+
+// Yjs 更新批量广播：将 16ms 内的多次更新合并为每客户端一次发送，
+// 将 N 用户 × N-1 发送降低为 N 次发送。
+const YJS_BATCH_INTERVAL_MS = 16;
+const pendingYjsBatches = new Map(); // canvasId -> { items: [{update, exceptSocket}], timer }
+
+function scheduleYjsBatch(canvasId) {
+  const pending = pendingYjsBatches.get(canvasId);
+  if (!pending || pending.timer) return;
+  pending.timer = setTimeout(flushYjsBatch, YJS_BATCH_INTERVAL_MS, canvasId);
+}
+
+function flushYjsBatch(canvasId) {
+  const pending = pendingYjsBatches.get(canvasId);
+  if (!pending) return;
+  pendingYjsBatches.delete(canvasId);
+  const room = getRoom(canvasId);
+  if (!room || !pending.items.length) return;
+  const items = pending.items;
+  // 预解码所有更新，避免在每个客户端上重复解码
+  const decodedItems = items
+    .map((item) => ({ update: decodeYUpdate(item.update), exceptSocket: item.exceptSocket }))
+    .filter((item) => item.update);
+  if (!decodedItems.length) return;
+  for (const client of room.values()) {
+    if (client.socket.readyState !== WebSocket.OPEN) continue;
+    const others = decodedItems.filter((item) => item.exceptSocket !== client.socket);
+    if (!others.length) continue;
+    const merged = others.length === 1
+      ? others[0].update
+      : Y.mergeUpdates(others.map((item) => item.update));
+    client.socket.send(JSON.stringify({
+      type: "yjs:update",
+      update: encodeYUpdate(merged),
+      sourceUserId: "server",
+    }));
+  }
+  // 跨实例广播：合并所有更新后 publish 到 Redis（远端客户端无需排除任何本地 socket）
+  const allUpdates = decodedItems.map((item) => item.update);
+  if (allUpdates.length) {
+    const mergedForRemote = allUpdates.length === 1
+      ? allUpdates[0]
+      : Y.mergeUpdates(allUpdates);
+    getBroadcastAdapter().publish(canvasId, {
+      type: "yjs:update",
+      update: encodeYUpdate(mergedForRemote),
+      sourceUserId: "server",
+    }).catch(() => {});
   }
 }
 
 function broadcastPresence(canvasId) {
   const room = getRoom(canvasId);
-  broadcast(room, { type: "presence:list", users: serializePeers(room) });
+  broadcast(room, { type: "presence:list", users: serializePeers(room) }, null, canvasId);
 }
 
-function broadcastAwarenessRemove(room, client) {
+function broadcastAwarenessRemove(room, client, canvasId) {
   if (!client?.awareness) return;
   broadcast(room, {
     type: "awareness:remove",
     clientId: client.awareness.clientId,
     userId: client.awareness.state?.user?.id,
-  }, client.socket);
+  }, client.socket, canvasId);
+}
+
+export function notifyCanvasAccessRevoked(canvasId, userId) {
+  const revokedUserId = String(userId || "");
+  getBroadcastAdapter().publish(canvasId, { type: "access:revoked", userId: revokedUserId }).catch(() => {});
+  const room = rooms.get(canvasId);
+  if (!room) return;
+  const message = JSON.stringify({ type: "access:revoked", userId: revokedUserId });
+  for (const [clientId, client] of room.entries()) {
+    if (client.socket.readyState !== WebSocket.OPEN) continue;
+    client.socket.send(message);
+    const clientUserId = String(client.presence?.id || clientId).split(":")[0];
+    if (clientUserId === revokedUserId) {
+      setTimeout(() => client.socket.close(1008, "canvas access revoked"), 25);
+    }
+  }
 }
 
 function getRoomSnapshot(canvasId) {
@@ -109,8 +181,8 @@ function getRoomSnapshot(canvasId) {
 
 async function getRoomYDoc(canvasId) {
   if (!roomYDocs.has(canvasId)) {
-    const db = await readJson();
-    roomYDocs.set(canvasId, restoreYDocFromDb(db, canvasId));
+    const persistence = await getCanvasYjsPersistenceDirect(canvasId);
+    roomYDocs.set(canvasId, buildYDocFromPersistence(persistence));
   }
   return roomYDocs.get(canvasId);
 }
@@ -148,9 +220,29 @@ export function applyEncodedYUpdate(doc, encodedUpdate, origin = "test") {
 export function attachCollaborationServer(server) {
   const wss = new WebSocketServer({ server, path: "/api/collaboration" });
 
-  wss.on("connection", (socket, request) => {
+  // 注册本地广播函数：Redis 适配器收到远端消息时调用此函数广播给本实例的客户端
+  setLocalBroadcast((canvasId, payload, exceptSocketId) => {
+    const room = getRoom(canvasId);
+    if (!room) return;
+    const message = JSON.stringify(payload);
+    for (const client of room.values()) {
+      if (client.socket.readyState !== WebSocket.OPEN) continue;
+      if (exceptSocketId && client.socket === exceptSocketId) continue;
+      client.socket.send(message);
+    }
+  });
+
+  wss.on("connection", async (socket, request) => {
     const url = new URL(request.url || "/", "http://localhost");
     const canvasId = url.searchParams.get("canvasId") || "local";
+    const token = String(url.searchParams.get("token") || "");
+    const tokenUser = token ? await getUserByAuthTokenHash(hashToken(token)).catch(() => null) : null;
+    const requestUserId = tokenUser?.id || String(url.searchParams.get("userId") || "");
+    const access = await getCanvasAccess(canvasId, requestUserId).catch(() => null);
+    if (!requestUserId || !access?.allowed) {
+      socket.close(1008, "canvas access denied");
+      return;
+    }
     const room = getRoom(canvasId);
     let clientId = "";
 
@@ -159,7 +251,7 @@ export function attachCollaborationServer(server) {
       if (!payload || typeof payload !== "object") return;
 
       if (payload.type === "presence:join") {
-        clientId = String(payload.user?.id || crypto.randomUUID());
+        clientId = String(payload.user?.id || requestUserId || crypto.randomUUID());
         room.set(clientId, {
           socket,
           joinedAt: Date.now(),
@@ -185,7 +277,7 @@ export function attachCollaborationServer(server) {
             sourceUserId: latestSnapshot.sourceUserId,
           }));
         }
-        broadcast(room, { type: "snapshot:request", requesterId: clientId }, socket);
+        broadcast(room, { type: "snapshot:request", requesterId: clientId }, socket, canvasId);
         broadcastPresence(canvasId);
         return;
       }
@@ -210,12 +302,13 @@ export function attachCollaborationServer(server) {
           type: "awareness:update",
           state: awareness,
           sourceUserId: clientId,
-        }, socket);
-        broadcast(room, { type: "presence:update", user: client.presence }, socket);
+        }, socket, canvasId);
+        broadcast(room, { type: "presence:update", user: client.presence }, socket, canvasId);
         return;
       }
 
       if (payload.type === "snapshot:update") {
+        if (!["owner", "editor"].includes(access.role)) return;
         const version = Number(payload.version || Date.now());
         const currentSnapshot = getRoomSnapshot(canvasId);
         const client = room.get(clientId);
@@ -234,21 +327,26 @@ export function attachCollaborationServer(server) {
           snapshot: payload.snapshot,
           version,
           sourceUserId: clientId,
-        }, socket);
+        }, socket, canvasId);
         return;
       }
 
       if (payload.type === "yjs:update") {
+        if (!["owner", "editor"].includes(access.role)) return;
         const ydoc = await getRoomYDoc(canvasId);
         if (!applyEncodedYUpdate(ydoc, payload.update, clientId)) return;
         persistYjsUpdate(canvasId, payload.update, { doc: ydoc }).catch((error) => {
           console.error("failed to persist yjs update", error);
         });
-        broadcast(room, {
-          type: "yjs:update",
+        // 批量广播：合并 16ms 内的多次更新，降低 WebSocket 发送次数
+        if (!pendingYjsBatches.has(canvasId)) {
+          pendingYjsBatches.set(canvasId, { items: [], timer: null });
+        }
+        pendingYjsBatches.get(canvasId).items.push({
           update: payload.update,
-          sourceUserId: clientId,
-        }, socket);
+          exceptSocket: socket,
+        });
+        scheduleYjsBatch(canvasId);
         return;
       }
 
@@ -266,7 +364,7 @@ export function attachCollaborationServer(server) {
         id: clientId,
         lastActiveAt: new Date().toISOString(),
       };
-      broadcast(room, { type: "presence:update", user: client.presence }, socket);
+      broadcast(room, { type: "presence:update", user: client.presence }, socket, canvasId);
     };
 
     socket.on("message", (raw) => {
@@ -278,10 +376,18 @@ export function attachCollaborationServer(server) {
     socket.on("close", () => {
       if (!clientId) return;
       const client = room.get(clientId);
-      broadcastAwarenessRemove(room, client);
+      broadcastAwarenessRemove(room, client, canvasId);
       room.delete(clientId);
       broadcastPresence(canvasId);
-      if (room.size === 0) rooms.delete(canvasId);
+      if (room.size === 0) {
+        rooms.delete(canvasId);
+        // 清理该房间的待发送批量更新，避免定时器泄漏
+        const pending = pendingYjsBatches.get(canvasId);
+        if (pending) {
+          if (pending.timer) clearTimeout(pending.timer);
+          pendingYjsBatches.delete(canvasId);
+        }
+      }
     });
   });
 

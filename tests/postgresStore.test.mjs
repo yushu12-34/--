@@ -5,6 +5,7 @@ import {
   decodeYjsPayload,
   encodeYjsPayload,
   preparePostgresSnapshot,
+  preserveExistingUserAuthFields,
   rowToAsset,
   rowToTask,
   rowToWorkflowSnapshot,
@@ -31,6 +32,42 @@ test("preparePostgresSnapshot adds default users and project owner members", () 
   })), [
     { projectId: "project:1", userId: "user:owner", role: "owner" },
   ]);
+});
+
+test("preparePostgresSnapshot preserves auth fields for existing users", () => {
+  const snapshot = preparePostgresSnapshot({
+    users: [{
+      id: "user:login",
+      name: "Login User",
+      email: "User@Example.COM",
+      passwordHash: "scrypt:salt:hash",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }],
+  }, { timestamp });
+
+  const user = snapshot.users.find((item) => item.id === "user:login");
+  assert.equal(user.email, "User@Example.COM");
+  assert.equal(user.passwordHash, "scrypt:salt:hash");
+});
+
+test("preserveExistingUserAuthFields keeps login fields when imported user is incomplete", () => {
+  const users = preserveExistingUserAuthFields([
+    { id: "user:login", name: "Login User" },
+  ], [
+    {
+      id: "user:login",
+      email: "login@example.com",
+      passwordHash: "scrypt:old:hash",
+      fingerprintHash: "fingerprint",
+      fingerprintVersion: 2,
+    },
+  ]);
+
+  assert.equal(users[0].email, "login@example.com");
+  assert.equal(users[0].passwordHash, "scrypt:old:hash");
+  assert.equal(users[0].fingerprintHash, "fingerprint");
+  assert.equal(users[0].fingerprintVersion, 2);
 });
 
 test("asset rows preserve legacy JSON-only fields in metadata", () => {

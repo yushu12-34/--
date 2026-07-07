@@ -461,18 +461,12 @@ export function observeYCanvas(
   yCanvas: YCanvasDocument,
   onChange: (snapshot: CanvasSnapshot, transaction: Y.Transaction, update?: Uint8Array) => void,
 ) {
-  const handleTransaction = (transaction: Y.Transaction) => {
-    if (!transaction.changed.size) return;
-    onChange(snapshotFromYDoc(yCanvas), transaction);
-  };
   const handleUpdate = (update: Uint8Array, origin: unknown, doc: Y.Doc, transaction: Y.Transaction) => {
     if (!transaction.changed.size) return;
     onChange(snapshotFromYDoc(yCanvas), transaction, update);
   };
-  yCanvas.doc.on("afterTransaction", handleTransaction);
   yCanvas.doc.on("update", handleUpdate);
   return () => {
-    yCanvas.doc.off("afterTransaction", handleTransaction);
     yCanvas.doc.off("update", handleUpdate);
   };
 }

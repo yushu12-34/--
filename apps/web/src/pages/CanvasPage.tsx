@@ -18,10 +18,10 @@ import {
   type OnConnectStartParams,
   type OnSelectionChangeParams,
 } from "@xyflow/react";
-import { compactYjsDocument, copyCanvas, copyProject, createAsset, createCanvas, createProject, createTask, createUser, deleteAsset, deleteCanvas, deleteProject, ensureProject, exportProject, getCanvas, getProject, getTask, getYjsHistorySnapshot, importProject, listAssets, listModels, listProjects, listUsers, listYjsHistory, saveSnapshot, saveSnapshotJson, updateAsset, updateCanvas, updateProject } from "../api";
+import { acceptCanvasInvite, compactYjsDocument, copyCanvas, copyProject, createAsset, createCanvas, createCanvasInvite, createProject, createTask, deleteAsset, deleteCanvas, deleteProject, ensureProject, exportProject, getAuthToken, getCanvas, getCurrentSession, getProject, getTask, getYjsHistorySnapshot, importProject, listAssets, listCanvasMembers, listCollaborativeCanvases, listModels, listProjects, listYjsHistory, loginUser, logoutUser, registerUser, removeCanvasMember, saveSnapshot, saveSnapshotJson, setAuthToken, updateAsset, updateCanvas, updateProject } from "../api";
 import { createCollaborationClient, type CollaborationStatus, type CollaborationUser } from "../collaboration";
 import { nodeDefinitions } from "../nodeDefinitions";
-import type { AITask, AssetRecord, CanvasRecord, CanvasSnapshot, ProjectRecord, UserRecord, WorkflowEdge, WorkflowGroup, WorkflowNode, YjsSnapshotDetail, YjsSnapshotRecord } from "../types";
+import type { AITask, AssetRecord, CanvasAccessRecord, CanvasMemberRecord, CanvasRecord, CanvasSnapshot, CollaborativeCanvasRecord, ProjectRecord, UserRecord, WorkflowEdge, WorkflowGroup, WorkflowNode, YjsSnapshotDetail, YjsSnapshotRecord } from "../types";
 import { collectNodeInputs, normalizePortId, validateConnection, validateNodeReady } from "../workflowValidation";
 import { topologicalExecutableOrder } from "../workflowGraph";
 import {
@@ -103,6 +103,7 @@ interface PendingSnapshotSave {
   canvasId: string;
   bodyJson: string;
   snapshotJson: string;
+  localRevision: number;
 }
 
 interface ConnectionPickerState {
@@ -112,6 +113,116 @@ interface ConnectionPickerState {
   flowY: number;
   dragStart: ConnectionDragStart;
   candidates: ConnectionPickerCandidate[];
+}
+
+type ContextMenuMode = "actions" | "nodes";
+
+type CanvasIconName =
+  | "add-node"
+  | "asset-space"
+  | "undo"
+  | "redo"
+  | "fit"
+  | "center"
+  | "help"
+  | "pin"
+  | "connected"
+  | "sync"
+  | "offline"
+  | "saved"
+  | "saving"
+  | "failed"
+  | "close"
+  | "add-asset"
+  | "paste"
+  | "text-node"
+  | "image-node"
+  | "audio-node"
+  | "video-node";
+
+function CanvasIcon({ name, className }: { name: CanvasIconName; className?: string }) {
+  const common = {
+    className,
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.8,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    "aria-hidden": true,
+  };
+
+  switch (name) {
+    case "add-node":
+      return <svg {...common}><rect x="4" y="4" width="7" height="7" rx="2" /><rect x="13" y="13" width="7" height="7" rx="2" /><path d="M14 7h5M16.5 4.5v5M7.5 11v4.5a2 2 0 0 0 2 2H13" /></svg>;
+    case "asset-space":
+      return <svg {...common}><path d="M5 7.5h14a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5l2 3.5" /><path d="m7 16 2.4-2.4a1.4 1.4 0 0 1 2 0L13 15.2l1-1a1.4 1.4 0 0 1 2 0L18 16" /><circle cx="16.5" cy="11" r="1" /></svg>;
+    case "undo":
+      return <svg {...common}><path d="M9 8H4V3" /><path d="M4.4 8.4A8 8 0 1 1 6 19.4" /></svg>;
+    case "redo":
+      return <svg {...common}><path d="M15 8h5V3" /><path d="M19.6 8.4A8 8 0 1 0 18 19.4" /></svg>;
+    case "fit":
+      return <svg {...common}><path d="M8 4H5a1 1 0 0 0-1 1v3M16 4h3a1 1 0 0 1 1 1v3M8 20H5a1 1 0 0 1-1-1v-3M16 20h3a1 1 0 0 0 1-1v-3" /><rect x="8" y="8" width="8" height="8" rx="2" /></svg>;
+    case "center":
+      return <svg {...common}><circle cx="12" cy="12" r="7" /><circle cx="12" cy="12" r="2" /><path d="M12 3v3M12 18v3M3 12h3M18 12h3" /></svg>;
+    case "help":
+      return <svg {...common}><circle cx="12" cy="12" r="8" /><path d="M9.8 9a2.4 2.4 0 0 1 4.5 1.2c0 1.8-2.3 2-2.3 3.5" /><path d="M12 17h.01" /></svg>;
+    case "pin":
+      return <svg {...common}><path d="m14 4 6 6-3 1-3.5 3.5.5 4-1 1-4-4L5 19l-.7-.7 3.5-4-4-4 1-1 4 .5L13 7l1-3Z" /></svg>;
+    case "connected":
+      return <svg {...common}><path d="M7 12a5 5 0 0 1 10 0" /><path d="M10 15a2 2 0 0 1 4 0" /><path d="M12 19h.01" /></svg>;
+    case "sync":
+      return <svg {...common}><path d="M20 11a8 8 0 0 0-14.4-4.8L4 8" /><path d="M4 4v4h4" /><path d="M4 13a8 8 0 0 0 14.4 4.8L20 16" /><path d="M16 16h4v4" /></svg>;
+    case "offline":
+      return <svg {...common}><path d="M3 3l18 18" /><path d="M7.2 7.2A7.8 7.8 0 0 1 12 5a8 8 0 0 1 8 8" /><path d="M16.2 16.2A2 2 0 0 0 14 14" /><path d="M8.9 13.2A4.2 4.2 0 0 1 12 12c.5 0 1 .1 1.4.2" /><path d="M12 19h.01" /></svg>;
+    case "saved":
+      return <svg {...common}><circle cx="12" cy="12" r="8" /><path d="m8.5 12.4 2.2 2.2 4.8-5.2" /></svg>;
+    case "saving":
+      return <svg {...common}><path d="M12 3a9 9 0 1 1-8.5 6" /><path d="M3 4v5h5" /></svg>;
+    case "failed":
+      return <svg {...common}><circle cx="12" cy="12" r="8" /><path d="M12 7.8v5" /><path d="M12 16.5h.01" /></svg>;
+    case "close":
+      return <svg {...common}><path d="M6 6l12 12M18 6 6 18" /></svg>;
+    case "add-asset":
+      return <svg {...common}><path d="M4 7h9l2 3h5v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2Z" /><path d="M12 12v5M9.5 14.5h5" /></svg>;
+    case "paste":
+      return <svg {...common}><path d="M9 5h6l1 2h2a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1h2l1-2Z" /><path d="M9 5a3 3 0 0 1 6 0" /></svg>;
+    case "text-node":
+      return <svg {...common}><path d="M5 6h14M12 6v12M9 18h6" /></svg>;
+    case "image-node":
+      return <svg {...common}><rect x="4" y="5" width="16" height="14" rx="3" /><path d="m7 16 3-3 2.2 2.2 1.6-1.7L17 16" /><circle cx="15.5" cy="9.5" r="1.2" /></svg>;
+    case "audio-node":
+      return <svg {...common}><path d="M9 9v6a3 3 0 1 1-2-2.8V7l9-2v8a3 3 0 1 1-2-2.8V6.2L9 7.3" /></svg>;
+    case "video-node":
+      return <svg {...common}><rect x="4" y="7" width="12" height="10" rx="2" /><path d="m16 11 4-2.5v7L16 13" /></svg>;
+    default:
+      return null;
+  }
+}
+
+function getNodeUiMeta(type: string) {
+  if (type === "text.input") return { label: "文本", description: "输入提示词与文本内容", icon: "text-node" as const };
+  if (type === "image.input") return { label: "图片素材", description: "上传或选择图片素材", icon: "image-node" as const };
+  if (type === "audio.input") return { label: "音频素材", description: "上传或选择音频素材", icon: "audio-node" as const };
+  if (type === "video.input") return { label: "视频素材", description: "上传或选择视频素材", icon: "video-node" as const };
+  if (type === "image.generate") return { label: "图片生成", description: "根据文本与参考图生成图片", icon: "image-node" as const };
+  if (type === "audio.generate") return { label: "音频生成", description: "根据文本生成音频", icon: "audio-node" as const };
+  if (type === "video.generate") return { label: "视频生成", description: "根据多模态输入生成视频", icon: "video-node" as const };
+  return { label: type, description: "配置创作节点", icon: "add-node" as const };
+}
+
+function getConnectionStatusTitle(status: CollaborationStatus, canvasDebugId?: string) {
+  if (status === "connected") return `已连接${canvasDebugId ? ` · ${canvasDebugId}` : ""}`;
+  if (status === "reconnecting") return "重连中";
+  if (status === "connecting") return "连接中";
+  return "离线";
+}
+
+function getSaveStatusTitle(status: "idle" | "saving" | "saved" | "failed") {
+  if (status === "saving") return "保存中";
+  if (status === "saved") return "已保存";
+  if (status === "failed") return "保存失败";
+  return "未保存";
 }
 
 function getPointerClientPoint(event: MouseEvent | TouchEvent) {
@@ -174,6 +285,11 @@ function getTaskDeadlineAt(task: AITask | null | undefined, fallbackStartedAt: n
   return Number.isFinite(parsedStartedAt) ? parsedStartedAt + timeoutMs : fallbackStartedAt + timeoutMs;
 }
 
+function getDefaultModelIdForNodeType(type: string) {
+  if (type === "video.generate") return "seedance-2-fast";
+  return "z-image-turbo";
+}
+
 export function CanvasPage() {
   const { screenToFlowPosition, setViewport, fitView } = useReactFlow<WorkflowReactNode, WorkflowReactEdge>();
   const updateNodeInternals = useUpdateNodeInternals();
@@ -186,8 +302,21 @@ export function CanvasPage() {
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [canvases, setCanvases] = useState<CanvasRecord[]>([]);
   const [canvas, setCanvas] = useState<CanvasRecord | null>(null);
-  const [users, setUsers] = useState<UserRecord[]>([]);
+  const [canvasAccess, setCanvasAccess] = useState<CanvasAccessRecord | null>(null);
+  const [workspaceMode, setWorkspaceMode] = useState<"workspace" | "shared">("workspace");
+  const [collaborativeCanvases, setCollaborativeCanvases] = useState<CollaborativeCanvasRecord[]>([]);
+  const [collaborationPickerOpen, setCollaborationPickerOpen] = useState(false);
+  const [inviteKeyInput, setInviteKeyInput] = useState("");
+  const [canvasMembers, setCanvasMembers] = useState<CanvasMemberRecord[]>([]);
+  const [memberPanelOpen, setMemberPanelOpen] = useState(false);
+  const [memberBusy, setMemberBusy] = useState(false);
   const [currentUser, setCurrentUser] = useState<UserRecord | null>(null);
+  const [authToken, setAuthTokenState] = useState(() => getAuthToken());
+  const [authRestoring, setAuthRestoring] = useState(() => Boolean(getAuthToken()));
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authForm, setAuthForm] = useState({ name: "", email: "", password: "" });
   const [workflowNodes, setWorkflowNodes] = useState<WorkflowNode[]>([]);
   const [groups, setGroups] = useState<WorkflowGroup[]>([]);
   const [rfNodes, setRfNodes, onNodesChange] = useNodesState<WorkflowReactNode>([]);
@@ -213,7 +342,7 @@ export function CanvasPage() {
   const [previewAsset, setPreviewAsset] = useState<AssetRecord | null>(null);
   const [previewResult, setPreviewResult] = useState<{ url: string; type: "image" | "audio" | "video"; title: string } | null>(null);
   const [models, setModels] = useState<Array<Record<string, unknown>>>([]);
-  const [notice, setNotice] = useState("正在初始化画布…");
+  const [notice, setNotice] = useState("正在初始化画布...");
   const [collaborationStatus, setCollaborationStatus] = useState<CollaborationStatus>("offline");
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "failed">("idle");
   const [collaborationUsers, setCollaborationUsers] = useState<CollaborationUser[]>([]);
@@ -239,14 +368,14 @@ export function CanvasPage() {
   const [nodeLibraryOpen, setNodeLibraryOpen] = useState(false);
   const [draggingTemplate, setDraggingTemplate] = useState<{
     type: string;
-    icon: string;
+    icon: CanvasIconName;
     startX: number;
     startY: number;
     x: number;
     y: number;
     moved: boolean;
   } | null>(null);
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; flowX: number; flowY: number; nodeId?: string } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; flowX: number; flowY: number; nodeId?: string; mode: ContextMenuMode } | null>(null);
   const [connectionPicker, setConnectionPicker] = useState<ConnectionPickerState | null>(null);
   const isDraggingNodeRef = useRef(false);
   const groupDragRef = useRef<{
@@ -266,6 +395,8 @@ export function CanvasPage() {
   const saveTimerRef = useRef(0);
   const pendingSaveRef = useRef<PendingSnapshotSave | null>(null);
   const lastSavedSnapshotJsonRef = useRef<string | null>(null);
+  const localSaveRevisionRef = useRef(0);
+  const lastSavedLocalSaveRevisionRef = useRef(0);
   const lastBroadcastSnapshotJsonRef = useRef<string | null>(null);
   const pendingBroadcastSnapshotJsonRef = useRef<string | null>(null);
   const lastLocalSnapshotJsonRef = useRef<string | null>(null);
@@ -295,6 +426,24 @@ export function CanvasPage() {
   const expandedNodeIdRef = useRef<string | null>(null);
   const selectedNodeIdRef = useRef<string | null>(null);
   const collaborationUsersRef = useRef<CollaborationUser[]>([]);
+  const isSharedCanvasRef = useRef(false);
+  const currentUserRef = useRef<UserRecord | null>(null);
+
+  const getUserScopedStorageKey = useCallback((key: string, userId = currentUserRef.current?.id || currentUser?.id || "") => {
+    return userId ? `${key}:${userId}` : key;
+  }, [currentUser?.id]);
+
+  const getCurrentCanvasStorageKey = useCallback((userId?: string) => (
+    getUserScopedStorageKey("anime-canvas-canvas-id", userId)
+  ), [getUserScopedStorageKey]);
+
+  const getCurrentProjectStorageKey = useCallback((userId?: string) => (
+    getUserScopedStorageKey("anime-canvas-project-id", userId)
+  ), [getUserScopedStorageKey]);
+
+  const getLocalSnapshotStorageKey = useCallback((userId?: string) => (
+    getUserScopedStorageKey(LOCAL_SNAPSHOT_KEY, userId)
+  ), [getUserScopedStorageKey]);
 
   const workflowEdges = useMemo(() => fromReactFlowEdges(rfEdges), [rfEdges]);
   useEffect(() => {
@@ -305,7 +454,11 @@ export function CanvasPage() {
     () => getVisibleAssetCount(project?.id, assetState, project?.assetCount ?? 0),
     [assetState, project?.assetCount, project?.id],
   );
+  const isSharedCanvas = workspaceMode === "shared";
+  const activeCanvasProjectId = canvas?.projectId || project?.id || "";
+  const canManageCurrentCanvas = Boolean(canvas && canvasAccess?.role === "owner" && !isSharedCanvas);
   const visibleAssetCountText = project?.id ? String(visibleAssetCount) : "加载中";
+  const canvasDebugId = canvas?.id ? canvas.id.slice(-6) : "";
   const assetLibraryLoading = Boolean(project?.id && assetState.loading && (assetState.projectId !== project.id || assetState.assets.length === 0));
   useEffect(() => {
     workflowNodesRef.current = workflowNodes;
@@ -319,9 +472,13 @@ export function CanvasPage() {
   useEffect(() => {
     expandedNodeIdRef.current = expandedNodeId;
   }, [expandedNodeId]);
+  useEffect(() => {
+    isSharedCanvasRef.current = isSharedCanvas;
+  }, [isSharedCanvas]);
+  useEffect(() => {
+    currentUserRef.current = currentUser;
+  }, [currentUser]);
 
-  // 节点展开/收起后，需要通知 React Flow 重新测量节点尺寸并刷新连接线端点位置。
-  // CSS 过渡动画约 180ms，在动画结束后再次刷新以确保最终尺寸正确。
   const prevExpandedNodeIdRef = useRef<string | null>(null);
   useEffect(() => {
     const targets = new Set<string>();
@@ -378,6 +535,10 @@ export function CanvasPage() {
       bundle.saveBodyJson = `{"snapshot":${bundle.snapshotJson}}`;
     }
     return bundle.saveBodyJson;
+  }, []);
+
+  const markLocalCanvasChange = useCallback(() => {
+    localSaveRevisionRef.current += 1;
   }, []);
 
   const cancelPendingSave = useCallback((snapshotJson?: string) => {
@@ -461,6 +622,22 @@ export function CanvasPage() {
     if (!yCanvas) return;
     return observeYCanvas(yCanvas, (snapshot, transaction, update) => {
       if (transaction.origin === Y_CANVAS_LOCAL_ORIGIN && syncingReactStateToYDocRef.current) return;
+      if (transaction.origin === Y_CANVAS_LOCAL_ORIGIN) {
+        markLocalCanvasChange();
+        skipNextYDocSyncRef.current = true;
+        if (update) {
+          lastYjsUpdateRef.current = update;
+          window.clearTimeout(yjsBroadcastTimerRef.current);
+          yjsBroadcastTimerRef.current = window.setTimeout(() => {
+            const update = lastYjsUpdateRef.current;
+            if (update) collaborationClientRef.current?.sendYjsUpdate(update);
+          }, 80);
+        }
+        return;
+      }
+      if (transaction.origin !== Y_CANVAS_REMOTE_ORIGIN && transaction.origin !== Y_CANVAS_LOAD_ORIGIN) {
+        markLocalCanvasChange();
+      }
       skipNextYDocSyncRef.current = true;
       applySnapshotFromYCanvas(snapshot);
       if (transaction.origin === Y_CANVAS_REMOTE_ORIGIN || transaction.origin === Y_CANVAS_LOAD_ORIGIN) return;
@@ -472,7 +649,7 @@ export function CanvasPage() {
         if (update) collaborationClientRef.current?.sendYjsUpdate(update);
       }, 80);
     });
-  }, [applySnapshotFromYCanvas]);
+  }, [applySnapshotFromYCanvas, markLocalCanvasChange]);
 
   useEffect(() => {
     return () => {
@@ -549,13 +726,13 @@ export function CanvasPage() {
           error: task.error,
         },
       });
-      if (task.status === "succeeded" && project) {
-        setNotice("图片生成完成，结果已保存到素材库");
+      if (task.status === "succeeded" && project && !isSharedCanvas) {
+        setNotice("图片生成完成，结果已保存到素材空间");
         await loadProjectAssets(project.id);
       }
       return task;
     },
-    [loadProjectAssets, patchNode, project],
+    [isSharedCanvas, loadProjectAssets, patchNode, project],
   );
 
   const pollTaskUntilSettled = useCallback(
@@ -619,33 +796,34 @@ export function CanvasPage() {
     async (nodeId: string, file: File, type: "image" | "audio" | "video") => {
       const url = await fileToDataUrl(file);
       patchNode(nodeId, { data: { ...(workflowNodes.find((node) => node.id === nodeId)?.data || {}), url, name: file.name } });
-      if (project) {
-        const created = await createAsset({ projectId: project.id, type, url, mimeType: file.type, size: file.size, source: "upload" });
+      if (activeCanvasProjectId && canvas) {
+        const created = await createAsset({ projectId: activeCanvasProjectId, canvasId: canvas.id, type, url, mimeType: file.type, size: file.size, source: "upload" });
         prependAsset(created.asset);
       }
     },
-    [patchNode, prependAsset, project, workflowNodes],
+    [activeCanvasProjectId, canvas, patchNode, prependAsset, workflowNodes],
   );
 
   const saveNodeResultAsAsset = useCallback(async (nodeId: string) => {
     const node = workflowNodes.find((item) => item.id === nodeId);
     const url = String(node?.data.resultUrl || node?.data.url || "");
-    if (!node || !project || !url) return;
+    if (!node || !activeCanvasProjectId || !canvas || !url) return;
     const type = node.type.includes("audio") ? "audio" : node.type.includes("video") ? "video" : "image";
     const created = await createAsset({
-      projectId: project.id,
+      projectId: activeCanvasProjectId,
+      canvasId: canvas.id,
       type,
       url,
-      name: `${node.title} 结果`,
+      name: `${node.title} 缁撴灉`,
       mimeType: type === "image" ? "image/png" : type === "audio" ? "audio/mpeg" : "video/mp4",
       size: 0,
       source: "ai-generated",
       createdBy: currentUser?.id,
     });
     prependAsset(created.asset);
-    setAssetLibraryOpen(true);
-    setNotice("节点结果已保存到素材库");
-  }, [currentUser, prependAsset, project, workflowNodes]);
+    if (!isSharedCanvas) setAssetLibraryOpen(true);
+    setNotice("节点结果已保存到素材空间");
+  }, [activeCanvasProjectId, canvas, currentUser, isSharedCanvas, prependAsset, workflowNodes]);
 
   const copyNodeResultUrl = useCallback(async (nodeId: string) => {
     const node = workflowNodes.find((item) => item.id === nodeId);
@@ -725,7 +903,7 @@ export function CanvasPage() {
 
   const runNode = useCallback(
     async (nodeId: string, options: { force?: boolean } = {}) => {
-      if (!project || !canvas) return false;
+      if (!activeCanvasProjectId || !canvas) return false;
       const node = workflowNodes.find((item) => item.id === nodeId);
       if (!node) return false;
       const ready = validateNodeReady(workflowNodes, workflowEdges, nodeId);
@@ -735,23 +913,24 @@ export function CanvasPage() {
       }
       try {
         const taskType = node.type as "image.generate" | "audio.generate" | "video.generate";
-        const currentModel = models.find((m) => m.id === (node.data.modelId || "z-image-turbo"));
+        const modelId = String(node.data.modelId || getDefaultModelIdForNodeType(node.type));
+        const currentModel = models.find((m) => m.id === modelId);
         const defaultParams = (currentModel?.defaultParams || {}) as Record<string, unknown>;
         const nodeParams = pickPublicParams(currentModel, (node.data.params || {}) as Record<string, unknown>);
         const inputSignature = getNodeInputSignature(node, workflowNodes, workflowEdges, currentModel);
-        if (!options.force && node.data.resultUrl && node.runtime.inputSignature === inputSignature) {
+        if (!options.force && node.data.resultUrl && node.runtime?.inputSignature === inputSignature) {
           patchNode(nodeId, { runtime: { status: "succeeded", progress: 100, inputSignature, cacheHit: true, error: undefined } });
-          setNotice("输入未变化，已使用缓存结果");
+          setNotice("后端已恢复连接并加载完成");
           return true;
         }
         patchNode(nodeId, { runtime: { status: "pending", progress: 0, inputSignature, cacheHit: false, error: undefined } });
         const inputValues = collectNodeInputs(workflowNodes, workflowEdges, nodeId);
         const response = await createTask({
-          projectId: project.id,
+          projectId: activeCanvasProjectId,
           canvasId: canvas.id,
           nodeId,
           type: taskType,
-          modelId: String(node.data.modelId || "z-image-turbo"),
+          modelId,
           input: {
             ...inputValues,
             prompt: String(node.data.prompt || inputValues.prompt || ""),
@@ -759,7 +938,7 @@ export function CanvasPage() {
           },
         });
         patchNode(nodeId, { runtime: { status: response.task.status, progress: response.task.progress || 0, taskId: response.task.id, inputSignature, cacheHit: false } });
-        setNotice("任务已创建，正在后台生成…");
+        setNotice("画布已连接后端并加载完成");
         const settledTask = await pollTaskUntilSettled(
           nodeId,
           response.task.id,
@@ -774,14 +953,16 @@ export function CanvasPage() {
         return false;
       }
     },
-    [canvas, project, workflowEdges, workflowNodes, patchNode, models, pollTaskUntilSettled],
+    [activeCanvasProjectId, canvas, workflowEdges, workflowNodes, patchNode, models, pollTaskUntilSettled],
   );
 
   const recoveryPolledRef = useRef(new Set<string>());
   useEffect(() => {
     for (const node of workflowNodes) {
-      const taskId = node.runtime.taskId;
-      if (!taskId || !["pending", "running"].includes(node.runtime.status)) continue;
+      const runtime = node.runtime;
+      if (!runtime) continue;
+      const taskId = runtime.taskId;
+      if (!taskId || !["pending", "running"].includes(runtime.status)) continue;
       if (recoveryPolledRef.current.has(taskId)) continue;
       recoveryPolledRef.current.add(taskId);
       pollTaskUntilSettled(node.id, taskId);
@@ -789,19 +970,23 @@ export function CanvasPage() {
   }, [pollTaskUntilSettled, workflowNodes]);
 
   const loadCanvasRecord = useCallback(async (canvasId: string, useLocalFallback = false) => {
-    const loadedCanvas = (await getCanvas(canvasId)).canvas;
+    const canvasResult = await getCanvas(canvasId);
+    const loadedCanvas = canvasResult.canvas;
     setCanvas(loadedCanvas);
-    localStorage.setItem("anime-canvas-canvas-id", loadedCanvas.id);
+    setCanvasAccess(canvasResult.access || null);
+    localStorage.setItem(getCurrentCanvasStorageKey(), loadedCanvas.id);
     const loadedSnapshotHasContent = Boolean(loadedCanvas.snapshot?.nodes?.length);
     const snapshot = loadedSnapshotHasContent
       ? migrateSnapshot(loadedCanvas.snapshot)
       : useLocalFallback
-        ? readLocalSnapshot()
+        ? readLocalSnapshot(getLocalSnapshotStorageKey())
         : migrateSnapshot(loadedCanvas.snapshot || { nodes: [], edges: [], viewport: { x: 0, y: 0, zoom: 1 } });
     const snapshotJson = JSON.stringify(snapshot);
     lastLocalSnapshotJsonRef.current = snapshotJson;
-    localStorage.setItem(LOCAL_SNAPSHOT_KEY, snapshotJson);
+    localStorage.setItem(getLocalSnapshotStorageKey(), snapshotJson);
     lastSavedSnapshotJsonRef.current = loadedSnapshotHasContent || !useLocalFallback ? snapshotJson : null;
+    localSaveRevisionRef.current = 0;
+    lastSavedLocalSaveRevisionRef.current = 0;
     pendingSaveRef.current = null;
     window.clearTimeout(saveTimerRef.current);
     saveTimerRef.current = 0;
@@ -809,25 +994,26 @@ export function CanvasPage() {
     const yCanvas = yCanvasRef.current;
     if (yCanvas) applySnapshotToYDoc(yCanvas, snapshot, Y_CANVAS_LOAD_ORIGIN);
     applySnapshotFromYCanvas(snapshot, { resetSelection: true });
-  }, [applySnapshotFromYCanvas]);
+  }, [applySnapshotFromYCanvas, getCurrentCanvasStorageKey, getLocalSnapshotStorageKey]);
 
   const loadBackendState = useCallback(async (isRetry = false) => {
+    const storedToken = getAuthToken();
+    if (!storedToken) {
+      setAuthRestoring(false);
+      return;
+    }
     if (backendLoadInFlightRef.current) return;
     backendLoadInFlightRef.current = true;
     try {
-      const [userResult, modelResult] = await Promise.all([listUsers(), listModels()]);
-      let loadedUsers = userResult.users;
-      if (!loadedUsers.length) {
-        const created = await createUser("默认用户");
-        loadedUsers = [created.user];
-      }
-      const savedUserId = localStorage.getItem("anime-canvas-active-user-id");
-      const activeUser = loadedUsers.find((user) => user.id === savedUserId) || loadedUsers[0];
+      const [sessionResult, modelResult, collaborativeResult] = await Promise.all([getCurrentSession(), listModels(), listCollaborativeCanvases()]);
+      const activeUser = sessionResult.user;
+      sessionStorage.setItem("anime-canvas-active-user-id", activeUser.id);
       localStorage.setItem("anime-canvas-active-user-id", activeUser.id);
       localUserRef.current = { ...localUserRef.current, id: activeUser.id, name: activeUser.name };
-      setUsers(loadedUsers);
       setCurrentUser(activeUser);
       setModels(modelResult.models);
+      setCollaborativeCanvases(collaborativeResult.canvases);
+      if (!isSharedCanvasRef.current) setWorkspaceMode("workspace");
 
       const { project: loadedProject, canvases: loadedCanvases } = await ensureProject(activeUser.id);
       const loadedProjects = (await listProjects()).projects;
@@ -836,9 +1022,9 @@ export function CanvasPage() {
       setProjects(loadedProjects);
       setProject(nextProject);
       activeProjectIdRef.current = nextProject.id;
-      localStorage.setItem("anime-canvas-project-id", nextProject.id);
+      localStorage.setItem(getCurrentProjectStorageKey(activeUser.id), nextProject.id);
       setCanvases(loadedCanvases);
-      const savedCanvasId = localStorage.getItem("anime-canvas-canvas-id");
+      const savedCanvasId = localStorage.getItem(getCurrentCanvasStorageKey(activeUser.id));
       const selectedCanvas = loadedCanvases.find((item) => item.id === savedCanvasId) || loadedCanvases[0];
       await loadCanvasRecord(selectedCanvas.id, true);
       await loadProjectAssets(nextProject.id);
@@ -846,9 +1032,16 @@ export function CanvasPage() {
       window.clearTimeout(backendRetryTimerRef.current);
       backendRetryTimerRef.current = 0;
       setNotice(isRetry ? "后端已恢复连接并加载完成" : "画布已连接后端并加载完成");
-    } catch {
+    } catch (error) {
+      if (String(error instanceof Error ? error.message : error).includes("Unauthorized")) {
+        setAuthToken("");
+        setAuthTokenState("");
+        setCurrentUser(null);
+        setAuthError("Session expired. Please sign in again.");
+        return;
+      }
       if (!backendLocalFallbackAppliedRef.current) {
-        const snapshot = readLocalSnapshot();
+        const snapshot = readLocalSnapshot(getLocalSnapshotStorageKey());
         const yCanvas = yCanvasRef.current;
         if (yCanvas) applySnapshotToYDoc(yCanvas, snapshot, Y_CANVAS_LOAD_ORIGIN);
         applySnapshotFromYCanvas(snapshot, { resetSelection: true });
@@ -861,14 +1054,181 @@ export function CanvasPage() {
       }, 4000);
     } finally {
       backendLoadInFlightRef.current = false;
+      setAuthRestoring(false);
     }
-  }, [applySnapshotFromYCanvas, loadCanvasRecord, loadProjectAssets]);
+  }, [applySnapshotFromYCanvas, authToken, loadCanvasRecord, loadProjectAssets]);
+
+  const submitAuth = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setAuthBusy(true);
+    setAuthError(null);
+    try {
+      const result = authMode === "register"
+        ? await registerUser(authForm)
+        : await loginUser({ email: authForm.email, password: authForm.password });
+      setAuthRestoring(true);
+      setAuthToken(result.token);
+      setAuthTokenState(result.token);
+      sessionStorage.setItem("anime-canvas-active-user-id", result.user.id);
+      localStorage.setItem("anime-canvas-active-user-id", result.user.id);
+      localUserRef.current = { ...localUserRef.current, id: result.user.id, name: result.user.name };
+      setCurrentUser(result.user);
+      setAuthForm({ name: "", email: "", password: "" });
+      await loadBackendState();
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const signOut = async () => {
+    await logoutUser().catch(() => {});
+    setAuthToken("");
+    setAuthTokenState("");
+    setAuthRestoring(false);
+    localStorage.removeItem("anime-canvas-active-user-id");
+    sessionStorage.removeItem("anime-canvas-active-user-id");
+    setCurrentUser(null);
+    setProjects([]);
+    setCanvases([]);
+    setProject(null);
+    setCanvas(null);
+    setCanvasAccess(null);
+    setWorkspaceMode("workspace");
+    setCollaborativeCanvases([]);
+    setCanvasMembers([]);
+    setMemberPanelOpen(false);
+    setCollaborationPickerOpen(false);
+    collaborationClientRef.current?.close();
+    setCollaborationUsers([]);
+  };
+
+  const createInviteForCurrentCanvas = async () => {
+    if (!canvas || !canManageCurrentCanvas) return;
+    const result = await createCanvasInvite(canvas.id, { role: "editor", expiresHours: 72, maxUses: 1 });
+    await navigator.clipboard?.writeText(result.invite.code).catch(() => {});
+    window.prompt("协同秘钥（单次有效，已尝试复制）", result.invite.code);
+    setNotice("协同画布列表已刷新");
+  };
+
+  const refreshCollaborativeCanvasList = useCallback(async () => {
+    const result = await listCollaborativeCanvases();
+    setCollaborativeCanvases(result.canvases);
+    return result.canvases;
+  }, []);
+
+  const enterCollaborativeCanvas = useCallback(async (target: CollaborativeCanvasRecord | CanvasRecord) => {
+    const targetCanvas = "canvas" in target ? target.canvas : target;
+    if (!targetCanvas?.id) return;
+    setWorkspaceMode("shared");
+    setProject(null);
+    setCanvases([targetCanvas]);
+    setAssetLibraryOpen(false);
+    setProjectDrawerOpen(false);
+    setCollaborationPickerOpen(false);
+    setAssetState({ projectId: null, assets: [], loading: false });
+    activeProjectIdRef.current = targetCanvas.projectId;
+    await loadCanvasRecord(targetCanvas.id);
+    setNotice("已创建协同邀请");
+  }, [loadCanvasRecord]);
+
+  const acceptInviteKey = useCallback(async (code: string) => {
+    const normalized = code.trim();
+    if (!normalized) return;
+    setProjectBusy(true);
+    setAuthError(null);
+    try {
+      const result = await acceptCanvasInvite(normalized);
+      setInviteKeyInput("");
+      await refreshCollaborativeCanvasList().catch(() => {});
+      if (result.canvas) {
+        await enterCollaborativeCanvas(result.canvas);
+      } else {
+        await loadBackendState(true);
+      }
+      setNotice("已加入协同画布");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const friendly = message === "used_up"
+        ? "这个秘钥已被使用。如果你已加入过，请从协同画布列表进入；否则请让画布所有者重新生成秘钥。"
+        : message === "expired"
+          ? "这个秘钥已过期，请让画布所有者重新生成。"
+          : message === "revoked"
+            ? "这个秘钥已失效，请让画布所有者重新生成。"
+            : `加入协同失败：${message}`;
+      setNotice(friendly);
+      setAuthError(friendly);
+    } finally {
+      setProjectBusy(false);
+    }
+  }, [enterCollaborativeCanvas, loadBackendState, refreshCollaborativeCanvasList]);
+
+  const exitSharedCanvas = async () => {
+    if (!canvas || !currentUser || !isSharedCanvas) return;
+    await refreshCollaborativeCanvasList().catch(() => {});
+    collaborationClientRef.current?.close();
+    setCollaborationUsers([]);
+    setWorkspaceMode("workspace");
+    setCanvasAccess(null);
+    setNotice("已切换到协同画布");
+    await loadBackendState(true);
+  };
+
+  const refreshCanvasMembers = async () => {
+    if (!canvas || !canManageCurrentCanvas) return;
+    setMemberBusy(true);
+    try {
+      const result = await listCanvasMembers(canvas.id);
+      setCanvasMembers(result.members);
+    } finally {
+      setMemberBusy(false);
+    }
+  };
+
+  const openMemberPanel = async () => {
+    setMemberPanelOpen(true);
+    await refreshCanvasMembers().catch((error) => {
+      setNotice(error instanceof Error ? error.message : String(error));
+    });
+  };
+
+  const removeCanvasMemberById = async (userId: string) => {
+    if (!canvas || !canManageCurrentCanvas) return;
+    if (!window.confirm("确定移除该协作者的画布权限吗？")) return;
+    setMemberBusy(true);
+    try {
+      await removeCanvasMember(canvas.id, userId);
+      await refreshCanvasMembers();
+      await refreshCollaborativeCanvasList().catch(() => {});
+      setNotice("已退出当前协同画布");
+    } finally {
+      setMemberBusy(false);
+    }
+  };
+
+  const acceptInviteFromUrl = useCallback(async () => {
+    if (!authToken) return;
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get("invite");
+    if (!code) return;
+    params.delete("invite");
+    const nextUrl = `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ""}${window.location.hash}`;
+    window.history.replaceState(null, "", nextUrl);
+    await acceptInviteKey(code);
+  }, [acceptInviteKey, authToken]);
+
+  useEffect(() => {
+    acceptInviteFromUrl().catch((error) => {
+      setAuthError(error instanceof Error ? error.message : String(error));
+    });
+  }, [acceptInviteFromUrl]);
 
   useEffect(() => {
     loadBackendState().catch(() => {});
   }, [loadBackendState]);
   useEffect(() => {
-    if (!canvas || !currentUser) return;
+    if (!canvas?.id || !currentUser?.id) return;
     collaborationClientRef.current?.close();
     collaborationClientRef.current = createCollaborationClient({
       canvasId: canvas.id,
@@ -936,6 +1296,16 @@ export function CanvasPage() {
           applyingRemoteSnapshotRef.current = false;
         }, 0);
       },
+      onAccessRevoked: () => {
+        if (!isSharedCanvasRef.current) return;
+        setWorkspaceMode("workspace");
+        setCanvasAccess(null);
+        setCollaborationPickerOpen(false);
+        setCollaborationUsers([]);
+        setNotice("你已被移出该协同画布，已返回个人工作区。");
+        void refreshCollaborativeCanvasList().catch(() => {});
+        void loadBackendState(true).catch(() => {});
+      },
     });
     setNotice("画布已连接后端并启用协作状态");
     return () => {
@@ -944,7 +1314,7 @@ export function CanvasPage() {
       setCollaborationUsers([]);
       setCollaborationStatus("offline");
     };
-  }, [canvas, currentUser]);
+  }, [canvas?.id, currentUser?.id, loadBackendState, refreshCollaborativeCanvasList]);
 
   useEffect(() => {
     collaborationClientRef.current?.update({
@@ -952,6 +1322,24 @@ export function CanvasPage() {
       editingNodeId: expandedNodeId || selectedNodeId || null,
     });
   }, [expandedNodeId, selectedNodeId, selectionNodeIds]);
+
+  useEffect(() => {
+    if (!isSharedCanvas || !canvas?.id || !currentUser?.id) return;
+    const timer = window.setInterval(() => {
+      getCanvas(canvas.id).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/Forbidden|Unauthorized|HTTP 403|HTTP 401/i.test(message)) return;
+        setWorkspaceMode("workspace");
+        setCanvasAccess(null);
+        setCollaborationPickerOpen(false);
+        setCollaborationUsers([]);
+        setNotice("你已被移出该协同画布，已返回个人工作区。");
+        void refreshCollaborativeCanvasList().catch(() => {});
+        void loadBackendState(true).catch(() => {});
+      });
+    }, 10000);
+    return () => window.clearInterval(timer);
+  }, [canvas?.id, currentUser?.id, isSharedCanvas, loadBackendState, refreshCollaborativeCanvasList]);
 
   const deleteNodes = useCallback((nodeIds: string[]) => {
     const nodeIdSet = new Set(nodeIds.filter(Boolean));
@@ -1070,22 +1458,30 @@ export function CanvasPage() {
     const { snapshot } = getSnapshotBundle();
     syncingReactStateToYDocRef.current = true;
     try {
+      markLocalCanvasChange();
       applySnapshotToYDoc(yCanvas, snapshot, Y_CANVAS_LOCAL_ORIGIN);
     } finally {
       syncingReactStateToYDocRef.current = false;
     }
-  }, [getSnapshotBundle]);
+  }, [getSnapshotBundle, markLocalCanvasChange]);
 
   useEffect(() => {
     const bundle = getSnapshotBundle();
+    const localSaveRevision = localSaveRevisionRef.current;
+    const hasLocalUnsavedChanges = localSaveRevision > lastSavedLocalSaveRevisionRef.current;
     if (lastLocalSnapshotJsonRef.current !== bundle.snapshotJson) {
-      localStorage.setItem(LOCAL_SNAPSHOT_KEY, bundle.snapshotJson);
+      localStorage.setItem(getLocalSnapshotStorageKey(), bundle.snapshotJson);
       lastLocalSnapshotJsonRef.current = bundle.snapshotJson;
     }
     if (applyingRemoteSnapshotRef.current) {
       window.clearTimeout(collaborationBroadcastTimerRef.current);
       pendingBroadcastSnapshotJsonRef.current = null;
-      cancelPendingSave(bundle.snapshotJson);
+      if (!hasLocalUnsavedChanges) {
+        window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = 0;
+        pendingSaveRef.current = null;
+        setSaveStatus("saved");
+      }
       return;
     }
     snapshotVersionRef.current = Date.now();
@@ -1109,12 +1505,24 @@ export function CanvasPage() {
       cancelPendingSave(bundle.snapshotJson);
       return;
     }
-    if (lastSavedSnapshotJsonRef.current === bundle.snapshotJson) return;
+    if (lastSavedSnapshotJsonRef.current === bundle.snapshotJson) {
+      lastSavedLocalSaveRevisionRef.current = Math.max(lastSavedLocalSaveRevisionRef.current, localSaveRevision);
+      setSaveStatus("saved");
+      return;
+    }
+    if (!hasLocalUnsavedChanges && lastSavedSnapshotJsonRef.current) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = 0;
+      pendingSaveRef.current = null;
+      setSaveStatus("saved");
+      return;
+    }
     if (pendingSaveRef.current?.canvasId === canvas.id && pendingSaveRef.current.snapshotJson === bundle.snapshotJson) return;
     pendingSaveRef.current = {
       canvasId: canvas.id,
       bodyJson: getSnapshotSaveBodyJson(bundle),
       snapshotJson: bundle.snapshotJson,
+      localRevision: localSaveRevision,
     };
     window.clearTimeout(saveTimerRef.current);
     setSaveStatus("saving");
@@ -1122,10 +1530,11 @@ export function CanvasPage() {
       saveTimerRef.current = 0;
       const pending = pendingSaveRef.current;
       if (!pending) return;
-      saveSnapshotJson(pending.canvasId, pending.bodyJson)
+      saveSnapshotJson(pending.canvasId, pending.bodyJson, { minimal: true })
         .then(() => {
           if (pendingSaveRef.current?.canvasId !== pending.canvasId || pendingSaveRef.current.snapshotJson !== pending.snapshotJson) return;
           lastSavedSnapshotJsonRef.current = pending.snapshotJson;
+          lastSavedLocalSaveRevisionRef.current = Math.max(lastSavedLocalSaveRevisionRef.current, pending.localRevision);
           pendingSaveRef.current = null;
           setSaveStatus("saved");
         })
@@ -1147,6 +1556,12 @@ export function CanvasPage() {
     setWorkflowNodes((current) => [...current, next]);
     setSelectedNodeId(next.id);
     setExpandedNodeId(next.id);
+  };
+
+  const addContextNode = (type: string) => {
+    if (!contextMenu) return;
+    addWorkflowNode(type, { x: contextMenu.flowX, y: contextMenu.flowY });
+    setContextMenu(null);
   };
 
   const commitWorkflowConnection = useCallback((connection: Connection, nodesForValidation = workflowNodes, edgesForValidation = workflowEdges) => {
@@ -1238,7 +1653,7 @@ export function CanvasPage() {
     const sourceNode = workflowNodeById.get(String(connection.source || ""));
     const targetPatch = applyConnectionDefaults(sourceNode, targetNode);
     if (targetPatch && targetNode) patchNode(targetNode.id, targetPatch);
-    setNotice("连接成功");
+    setNotice("杩炴帴鎴愬姛");
   };
 
   const onConnectStart = (_event: MouseEvent | TouchEvent, params: OnConnectStartParams) => {
@@ -1323,7 +1738,7 @@ export function CanvasPage() {
     setExpandedNodeId(committedNode.id);
     setSelectedEdgeId(null);
     setTraceConnection(null);
-    setNotice(`已创建「${candidate.name}」并完成连接`);
+    setNotice(`宸插垱寤恒€?{candidate.name}銆嶅苟瀹屾垚杩炴帴`);
   }, [commitWorkflowConnection, connectionPicker, patchNode]);
 
   const deleteSelected = useCallback(() => {
@@ -1435,7 +1850,7 @@ export function CanvasPage() {
     const yCanvas = yCanvasRef.current;
     if (yCanvas && canUndoYCanvas(yCanvas)) {
       undoYCanvas(yCanvas);
-      setNotice("已撤销");
+      setNotice("宸叉挙閿€");
       return;
     }
     const previous = historyRef.current.past.pop();
@@ -1444,7 +1859,7 @@ export function CanvasPage() {
     historyRef.current.future.push(current);
     historyRef.current.restoring = true;
     applyCanvasSnapshot(previous);
-    setNotice("已撤销");
+    setNotice("宸叉挙閿€");
   }, [applyCanvasSnapshot]);
 
   const redoCanvas = useCallback(() => {
@@ -1478,26 +1893,29 @@ export function CanvasPage() {
   const saveNow = async () => {
     const bundle = getSnapshotBundle();
     if (lastLocalSnapshotJsonRef.current !== bundle.snapshotJson) {
-      localStorage.setItem(LOCAL_SNAPSHOT_KEY, bundle.snapshotJson);
+      localStorage.setItem(getLocalSnapshotStorageKey(), bundle.snapshotJson);
       lastLocalSnapshotJsonRef.current = bundle.snapshotJson;
     }
     if (!canvas) {
       setNotice("已保存到浏览器本地");
       setSaveStatus("saved");
+      lastSavedLocalSaveRevisionRef.current = localSaveRevisionRef.current;
       return;
     }
     const bodyJson = getSnapshotSaveBodyJson(bundle);
+    const localRevision = localSaveRevisionRef.current;
     window.clearTimeout(saveTimerRef.current);
     saveTimerRef.current = 0;
-    pendingSaveRef.current = { canvasId: canvas.id, bodyJson, snapshotJson: bundle.snapshotJson };
+    pendingSaveRef.current = { canvasId: canvas.id, bodyJson, snapshotJson: bundle.snapshotJson, localRevision };
     setSaveStatus("saving");
-    await saveSnapshotJson(canvas.id, bodyJson);
+    await saveSnapshotJson(canvas.id, bodyJson, { minimal: true });
     const savedSnapshotStillCurrent = pendingSaveRef.current?.canvasId === canvas.id && pendingSaveRef.current.snapshotJson === bundle.snapshotJson;
     lastSavedSnapshotJsonRef.current = bundle.snapshotJson;
+    lastSavedLocalSaveRevisionRef.current = Math.max(lastSavedLocalSaveRevisionRef.current, localRevision);
     if (!savedSnapshotStillCurrent) return;
     pendingSaveRef.current = null;
     setSaveStatus("saved");
-    setNotice("已保存到后端快照");
+    setNotice("宸蹭繚瀛樺埌鍚庣蹇収");
   };
 
   const refreshProjectList = async () => {
@@ -1512,7 +1930,8 @@ export function CanvasPage() {
 
   const loadProjectRecord = async (projectId: string, preferredCanvasId?: string, projectSummaries = projects) => {
     const loaded = await getProject(projectId);
-    localStorage.setItem("anime-canvas-project-id", loaded.project.id);
+    setWorkspaceMode("workspace");
+    localStorage.setItem(getCurrentProjectStorageKey(), loaded.project.id);
     const projectSummary = projectSummaries.find((item) => item.id === loaded.project.id);
     const nextProject = projectSummary ? { ...loaded.project, ...projectSummary } : loaded.project;
     setProject(nextProject);
@@ -1549,7 +1968,7 @@ export function CanvasPage() {
       await refreshProjectList();
       await loadProjectRecord(created.project.id, created.canvas.id);
       setProjectDrawerOpen(true);
-      setNotice("新项目已创建");
+      setNotice("鏂伴」鐩凡鍒涘缓");
     } finally {
       setProjectBusy(false);
     }
@@ -1713,10 +2132,10 @@ export function CanvasPage() {
       `当前：${before.nodes} 节点 / ${before.edges} 连线 / ${before.groups} 组合`,
       `目标：${after.nodes} 节点 / ${after.edges} 连线 / ${after.groups} 组合`,
       isEmptyTarget ? "目标快照为空画布，请确认不是误操作。" : "",
-      "确定继续吗？",
+      "纭畾缁х画鍚楋紵",
     ].filter(Boolean).join("\n");
     if (!window.confirm(message)) return;
-    if (isEmptyTarget && !window.confirm("再次确认：这会把当前画布恢复为空历史版本。")) return;
+    if (isEmptyTarget && !window.confirm("目标为空，确认要恢复为空画布吗？")) return;
     const yCanvas = yCanvasRef.current;
     if (!yCanvas) return;
     setHistoryBusy(true);
@@ -1729,7 +2148,7 @@ export function CanvasPage() {
       collaborationClientRef.current?.sendSnapshot(restoredSnapshot, Date.now());
       setYjsHistory((await listYjsHistory(canvas.id)).snapshots);
       setHistoryRestoreSummary({ before, after });
-      setNotice("已恢复到选中的历史版本");
+      setNotice("历史版本恢复失败");
     } catch (error) {
       setHistoryError(error instanceof Error ? error.message : String(error));
       setNotice("历史版本恢复失败");
@@ -1782,30 +2201,6 @@ export function CanvasPage() {
     setCanvases((current) => current.filter((item) => item.id !== canvas.id));
     await loadCanvasRecord(result.nextCanvas.id);
     setNotice("画布已删除");
-  };
-
-  const switchUser = async (userId: string) => {
-    const user = users.find((item) => item.id === userId);
-    if (!user) return;
-    localStorage.setItem("anime-canvas-active-user-id", user.id);
-    localUserRef.current = { ...localUserRef.current, id: user.id, name: user.name };
-    setCurrentUser(user);
-    collaborationClientRef.current?.close();
-    setCollaborationUsers([]);
-    setNotice(`已切换为 ${user.name}`);
-  };
-
-  const addUser = async () => {
-    const name = window.prompt("请输入用户名称", `用户${users.length + 1}`);
-    if (!name) return;
-    const created = (await createUser(name)).user;
-    setUsers((current) => [...current, created]);
-    localStorage.setItem("anime-canvas-active-user-id", created.id);
-    localUserRef.current = { ...localUserRef.current, id: created.id, name: created.name };
-    setCurrentUser(created);
-    collaborationClientRef.current?.close();
-    setCollaborationUsers([]);
-    setNotice(`已新增并切换为 ${created.name}`);
   };
 
   useEffect(() => {
@@ -1928,7 +2323,7 @@ export function CanvasPage() {
     const timestamp = new Date().toISOString();
     const group: WorkflowGroup = {
       id: createId("group"),
-      title: `组合 ${groups.length + 1}`,
+      title: `缁勫悎 ${groups.length + 1}`,
       nodeIds: selectedNodeIds,
       bounds,
       createdAt: timestamp,
@@ -1937,10 +2332,10 @@ export function CanvasPage() {
     if (yCanvas) upsertYCanvasGroup(yCanvas, group, Y_CANVAS_LOCAL_ORIGIN);
     setGroups((current) => [
       ...current,
-      { ...group, title: `组合 ${current.length + 1}` },
+      { ...group, title: `缁勫悎 ${current.length + 1}` },
     ]);
     setSelectionBounds(null);
-    setNotice("已根据框选自动创建组合框");
+    setNotice("宸叉牴鎹閫夎嚜鍔ㄥ垱寤虹粍鍚堟");
   }, [getWorkflowNodesByIds, groups, selectionBounds]);
 
   useEffect(() => {
@@ -2067,7 +2462,7 @@ export function CanvasPage() {
       return;
     }
     patchGroupRuntime({ status: "running", total: ordered.length, completed: 0, failed: 0, skipped: 0 });
-    setNotice(`开始运行组合：${ordered.length} 个生成节点`);
+    setNotice(`开始运行组合，共 ${ordered.length} 个生成节点`);
     let completed = 0;
     let failed = 0;
     let skipped = 0;
@@ -2099,69 +2494,140 @@ export function CanvasPage() {
     [projects],
   );
 
+  if (authToken && (authRestoring || !currentUser)) {
+    return (
+      <main className="auth-screen">
+        <section className="auth-panel">
+          <div>
+            <strong>正在恢复登录</strong>
+            <span>正在加载你的工作区和协同画布...</span>
+          </div>
+        </section>
+      </main>
+    );
+  }
+
+  if (!authToken || !currentUser) {
+    return (
+      <main className="auth-screen">
+        <form className="auth-panel" onSubmit={submitAuth}>
+          <div>
+            <strong>{authMode === "register" ? "注册账号" : "登录账号"}</strong>
+            <span>{new URLSearchParams(window.location.search).get("invite") ? "请先登录，再加入受邀画布。" : "每个账号都有独立的项目和画布空间。"}</span>
+          </div>
+          {authMode === "register" && (
+            <input
+              value={authForm.name}
+              onChange={(event) => setAuthForm((current) => ({ ...current, name: event.target.value }))}
+              placeholder="昵称"
+              autoComplete="name"
+            />
+          )}
+          <input
+            value={authForm.email}
+            onChange={(event) => setAuthForm((current) => ({ ...current, email: event.target.value }))}
+            placeholder="邮箱"
+            type="email"
+            autoComplete="email"
+            required
+          />
+          <input
+            value={authForm.password}
+            onChange={(event) => setAuthForm((current) => ({ ...current, password: event.target.value }))}
+            placeholder="密码"
+            type="password"
+            autoComplete={authMode === "register" ? "new-password" : "current-password"}
+            minLength={6}
+            required
+          />
+          {authError && <span className="auth-error">{authError}</span>}
+          <button type="submit" disabled={authBusy}>{authBusy ? "处理中..." : authMode === "register" ? "注册" : "登录"}</button>
+          <button type="button" onClick={() => setAuthMode(authMode === "register" ? "login" : "register")}>
+            {authMode === "register" ? "已有账号，去登录" : "没有账号，去注册"}
+          </button>
+        </form>
+      </main>
+    );
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
         <div>
           <strong>无限画布 AI 动漫创作工具</strong>
-          <span>{project?.name || "本地项目"}</span>
+          <span>{isSharedCanvas ? `协同画布 - ${canvas?.name || ""}` : project?.name || "本地项目"}</span>
         </div>
         <nav>
-          <div className="project-switcher">
-            <select value={project?.id || ""} onChange={(event) => switchProject(event.target.value)} title="当前项目">
-              {projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-            </select>
-            <button type="button" className="topbar-action-trigger" onClick={() => setProjectDrawerOpen(true)} disabled={projectBusy}>项目</button>
-            <div className="topbar-action-menu">
-              <button type="button" className="topbar-action-trigger" aria-haspopup="menu">操作</button>
-              <div className="topbar-action-popover" role="menu">
-                <button type="button" role="menuitem" onClick={() => setProjectDrawerOpen(true)}>项目列表</button>
-                <button type="button" role="menuitem" onClick={addProject}>新项目</button>
-                <button type="button" role="menuitem" onClick={renameProject} disabled={!project}>重命名</button>
-                <button type="button" role="menuitem" onClick={duplicateProject} disabled={!project}>复制</button>
-                <button type="button" role="menuitem" onClick={() => removeProject()} disabled={!project}>删除</button>
-                <button type="button" role="menuitem" onClick={exportCurrentProject} disabled={!project}>导出</button>
-                <button type="button" role="menuitem" onClick={() => importFileRef.current?.click()}>导入</button>
-                <button type="button" role="menuitem" onClick={refreshYjsHistory} disabled={!canvas}>历史</button>
-              </div>
+          <button type="button" className="topbar-action-trigger" onClick={() => setCollaborationPickerOpen(true)}>加入协同</button>
+          {isSharedCanvas && (
+            <div className="shared-canvas-banner">
+              <strong>{canvas?.name || "协同画布"}</strong>
+              <span>{canvasAccess?.role === "viewer" ? "只读协同" : "协同编辑"}</span>
             </div>
-            <input
-              ref={importFileRef}
-              className="hidden-file-input"
-              type="file"
-              accept="application/json"
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                event.currentTarget.value = "";
-                if (file) void importProjectFromFile(file);
-              }}
-            />
-          </div>
-          <div className="canvas-switcher">
-            <select value={currentUser?.id || ""} onChange={(event) => switchUser(event.target.value)} title="当前用户">
-              {users.map((user) => <option key={user.id} value={user.id}>{user.name}</option>)}
-            </select>
-            <button type="button" onClick={addUser}>新用户</button>
-          </div>
-          <div className="canvas-switcher">
-            <select value={canvas?.id || ""} onChange={(event) => switchCanvas(event.target.value)} title="当前画布">
-              {canvases.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-            </select>
-            <div className="topbar-action-menu">
-              <button type="button" className="topbar-action-trigger" aria-haspopup="menu">画布操作</button>
-              <div className="topbar-action-popover" role="menu">
-                <button type="button" role="menuitem" onClick={addCanvas}>新画布</button>
-                <button type="button" role="menuitem" onClick={renameCanvas}>重命名</button>
-                <button type="button" role="menuitem" onClick={duplicateCanvas}>复制</button>
-                <button type="button" role="menuitem" onClick={removeCanvas} disabled={canvases.length <= 1}>删除</button>
-              </div>
+          )}
+          {isSharedCanvas && (
+            <div className="current-account" title="current account">
+              <span>{currentUser?.email || currentUser?.name}</span>
             </div>
+          )}
+          {!isSharedCanvas && (
+            <>
+              <div className="project-switcher">
+                <select value={project?.id || ""} onChange={(event) => switchProject(event.target.value)} title="当前项目">
+                  {projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                </select>
+                <button type="button" className="topbar-action-trigger" onClick={() => setProjectDrawerOpen(true)} disabled={projectBusy}>项目</button>
+                <div className="topbar-action-menu">
+                  <button type="button" className="topbar-action-trigger" aria-haspopup="menu">操作</button>
+                  <div className="topbar-action-popover" role="menu">
+                    <button type="button" role="menuitem" onClick={() => setProjectDrawerOpen(true)}>项目列表</button>
+                    <button type="button" role="menuitem" onClick={addProject}>新项目</button>
+                    <button type="button" role="menuitem" onClick={renameProject} disabled={!project}>重命名</button>
+                    <button type="button" role="menuitem" onClick={duplicateProject} disabled={!project}>复制</button>
+                    <button type="button" role="menuitem" onClick={() => removeProject()} disabled={!project}>删除</button>
+                    <button type="button" role="menuitem" onClick={exportCurrentProject} disabled={!project}>导出</button>
+                    <button type="button" role="menuitem" onClick={() => importFileRef.current?.click()}>导入</button>
+                    <button type="button" role="menuitem" onClick={refreshYjsHistory} disabled={!canvas}>历史</button>
+                  </div>
+                </div>
+                <input
+                  ref={importFileRef}
+                  className="hidden-file-input"
+                  type="file"
+                  accept="application/json"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    event.currentTarget.value = "";
+                    if (file) void importProjectFromFile(file);
+                  }}
+                />
+              </div>
+              <div className="current-account" title="current account">
+                <span>{currentUser?.email || currentUser?.name}</span>
+              </div>
+              <div className="canvas-switcher">
+                <select value={canvas?.id || ""} onChange={(event) => switchCanvas(event.target.value)} title="当前画布">
+                  {canvases.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                </select>
+                <div className="topbar-action-menu">
+                  <button type="button" className="topbar-action-trigger" aria-haspopup="menu">画布操作</button>
+                  <div className="topbar-action-popover" role="menu">
+                    <button type="button" role="menuitem" onClick={addCanvas}>新画布</button>
+                    <button type="button" role="menuitem" onClick={renameCanvas}>重命名</button>
+                    <button type="button" role="menuitem" onClick={duplicateCanvas}>复制</button>
+                    <button type="button" role="menuitem" onClick={createInviteForCurrentCanvas} disabled={!canvas}>邀请协作</button>
+                    <button type="button" role="menuitem" onClick={openMemberPanel} disabled={!canManageCurrentCanvas}>成员管理</button>
+                    <button type="button" role="menuitem" onClick={removeCanvas} disabled={canvases.length <= 1}>删除</button>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+          <div className={`status-pill status-icon-pill ${collaborationStatus}`} title={getConnectionStatusTitle(collaborationStatus, canvasDebugId)} aria-label={getConnectionStatusTitle(collaborationStatus, canvasDebugId)}>
+            <CanvasIcon name={collaborationStatus === "connected" ? "connected" : collaborationStatus === "offline" ? "offline" : "sync"} />
           </div>
-          <div className={`status-pill ${collaborationStatus}`} title="协作连接状态">
-            {collaborationStatus === "connected" ? "已连接" : collaborationStatus === "reconnecting" ? "重连中" : collaborationStatus === "connecting" ? "连接中" : "离线"}
-          </div>
-          <div className={`status-pill save-${saveStatus}`} title="保存状态">
-            {saveStatus === "saving" ? "保存中" : saveStatus === "saved" ? "已保存" : saveStatus === "failed" ? "保存失败" : "未保存"}
+          <div className={`status-pill status-icon-pill save-${saveStatus}`} title={getSaveStatusTitle(saveStatus)} aria-label={getSaveStatusTitle(saveStatus)}>
+            <CanvasIcon name={saveStatus === "saving" ? "saving" : saveStatus === "saved" ? "saved" : saveStatus === "failed" ? "failed" : "sync"} />
           </div>
           <div className="collaboration-users" title="在线协作者">
             <span className="collaboration-dot" />
@@ -2194,8 +2660,15 @@ export function CanvasPage() {
               </div>
             )}
           </div>
-          <button className={`asset-library-top-button ${assetLibraryOpen ? "active" : ""}`} onClick={() => setAssetLibraryOpen((open) => !open)}>素材库</button>
+          {!isSharedCanvas && (
+            <button className={`asset-library-top-button ${assetLibraryOpen ? "active" : ""}`} onClick={() => setAssetLibraryOpen((open) => !open)}>
+              <CanvasIcon name="asset-space" />
+              素材空间
+            </button>
+          )}
           <button className="weui-btn weui-btn_mini weui-btn_primary" onClick={saveNow}>保存</button>
+          {isSharedCanvas && <button className="weui-btn weui-btn_mini" onClick={exitSharedCanvas}>退出当前画布</button>}
+          <button className="weui-btn weui-btn_mini" onClick={signOut}>退出</button>
         </nav>
       </header>
       {collaborationConflict && (
@@ -2208,6 +2681,80 @@ export function CanvasPage() {
         </div>
       )}
 
+
+      {collaborationPickerOpen && (
+        <div className="asset-preview" onClick={() => setCollaborationPickerOpen(false)}>
+          <div className="asset-preview-card collaboration-picker-card" onClick={(event) => event.stopPropagation()}>
+            <header>
+              <div>
+                <strong>加入协同</strong>
+                <span>输入单次秘钥，或选择已有权限的画布进入</span>
+              </div>
+              <button type="button" onClick={() => setCollaborationPickerOpen(false)}>x</button>
+            </header>
+            <div className="invite-key-row">
+              <input
+                value={inviteKeyInput}
+                onChange={(event) => setInviteKeyInput(event.target.value)}
+                placeholder="输入协同秘钥"
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") void acceptInviteKey(inviteKeyInput);
+                }}
+              />
+              <button type="button" onClick={() => acceptInviteKey(inviteKeyInput)} disabled={!inviteKeyInput.trim() || projectBusy}>{projectBusy ? "加入中..." : "加入"}</button>
+            </div>
+            <div className="collaborative-canvas-list">
+              {collaborativeCanvases.length === 0 ? (
+                <div className="collaboration-empty">暂无可进入的协同画布</div>
+              ) : collaborativeCanvases.map((entry) => (
+                <button key={entry.canvas.id} type="button" className="collaborative-canvas-row" onClick={() => enterCollaborativeCanvas(entry)}>
+                  <span>
+                    <strong>{entry.canvas.name}</strong>
+                    <small>{entry.owner?.name || entry.owner?.email || entry.owner?.id || "未知所有者"}</small>
+                  </span>
+                  <em>{entry.role === "viewer" ? "只读" : "可编辑"}</em>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {memberPanelOpen && (
+        <div className="asset-preview" onClick={() => setMemberPanelOpen(false)}>
+          <div className="asset-preview-card collaboration-picker-card" onClick={(event) => event.stopPropagation()}>
+            <header>
+              <div>
+                <strong>画布成员</strong>
+                <span>{canvas?.name || "当前画布"}</span>
+              </div>
+              <button type="button" onClick={() => setMemberPanelOpen(false)}>x</button>
+            </header>
+            <div className="member-panel-toolbar">
+              <button type="button" onClick={createInviteForCurrentCanvas} disabled={!canManageCurrentCanvas}>生成单次秘钥</button>
+              <button type="button" onClick={refreshCanvasMembers} disabled={memberBusy}>刷新</button>
+            </div>
+            <div className="member-list">
+              {canvasMembers.map((member) => (
+                <article key={member.userId} className="member-row">
+                  <span>
+                    <strong>{member.userName || member.userEmail || member.userId}</strong>
+                    <small>{member.userEmail || member.userId}</small>
+                  </span>
+                  <em>{member.role === "owner" ? "所有者" : member.role === "viewer" ? "只读" : "可编辑"}</em>
+                  <button
+                    type="button"
+                    onClick={() => removeCanvasMemberById(member.userId)}
+                    disabled={memberBusy || member.role === "owner"}
+                  >绉婚櫎</button>
+                </article>
+              ))}
+              {!canvasMembers.length && <div className="collaboration-empty">鏆傛棤鎴愬憳</div>}
+            </div>
+          </div>
+        </div>
+      )}
+
       {projectDrawerOpen && (
         <aside className="project-drawer">
           <header>
@@ -2215,7 +2762,7 @@ export function CanvasPage() {
               <strong>项目列表</strong>
               <span>{projects.length} 个项目 · 当前 {project?.name || "未选择"}</span>
             </div>
-            <button type="button" onClick={() => setProjectDrawerOpen(false)}>×</button>
+            <button type="button" onClick={() => setProjectDrawerOpen(false)}>关闭</button>
           </header>
           <div className="project-drawer-actions">
             <button type="button" onClick={addProject} disabled={projectBusy}>新项目</button>
@@ -2267,7 +2814,7 @@ export function CanvasPage() {
                 <strong>Yjs 历史快照</strong>
                 <span>{canvas?.name || "当前画布"}</span>
               </div>
-              <button type="button" onClick={() => setHistoryPanelOpen(false)}>×</button>
+              <button type="button" onClick={() => setHistoryPanelOpen(false)}>关闭</button>
             </header>
             {historyError && <div className="history-error">{historyError}</div>}
             <div className="history-list">
@@ -2292,7 +2839,7 @@ export function CanvasPage() {
                   <strong>{historyRestoreSummary.before.nodes} 节点 · {historyRestoreSummary.before.edges} 连线 · {historyRestoreSummary.before.groups} 组合</strong>
                 </div>
                 <div>
-                  <span>选中版本</span>
+                  <span>閫変腑鐗堟湰</span>
                   <strong>{historyRestoreSummary.after.nodes} 节点 · {historyRestoreSummary.after.edges} 连线 · {historyRestoreSummary.after.groups} 组合</strong>
                 </div>
               </section>
@@ -2305,15 +2852,15 @@ export function CanvasPage() {
                 </div>
                 <dl>
                   <div>
-                    <dt>节点</dt>
+                    <dt>鑺傜偣</dt>
                     <dd>{selectedYjsHistoryDetail.summary.nodes}</dd>
                   </div>
                   <div>
-                    <dt>连线</dt>
+                    <dt>杩炵嚎</dt>
                     <dd>{selectedYjsHistoryDetail.summary.edges}</dd>
                   </div>
                   <div>
-                    <dt>组合</dt>
+                    <dt>缁勫悎</dt>
                     <dd>{selectedYjsHistoryDetail.summary.groups}</dd>
                   </div>
                 </dl>
@@ -2336,114 +2883,119 @@ export function CanvasPage() {
         <div className="floating-node-library">
           <span className="floating-library-title">添加节点</span>
           <div className="floating-library-list">
-            {nodeDefinitions.map((definition) => (
-              <button
-                key={definition.type}
-                className="floating-node-template"
-                onClick={() => {
-                  addWorkflowNode(definition.type);
-                  setNodeLibraryOpen(false);
-                }}
-                onPointerDown={(event) => {
-                  event.preventDefault();
-                  setDraggingTemplate({
-                    type: definition.type,
-                    icon: getNodeIcon(definition.type),
-                    startX: event.clientX,
-                    startY: event.clientY,
-                    x: event.clientX,
-                    y: event.clientY,
-                    moved: false,
-                  });
-                  setNotice(`拖动「${definition.name}」到画布后松开放置`);
-                }}
-              >
-                <span className="floating-node-icon">{getNodeIcon(definition.type)}</span>
-                <strong>{definition.name}</strong>
-                {definition.type === "text.input" && <em>Gemini3</em>}
-                {definition.type === "image.generate" && <em>Neo Image Pro</em>}
-                <small>{definition.description || "配置创作节点"}</small>
-              </button>
-            ))}
+            {nodeDefinitions.map((definition) => {
+              const meta = getNodeUiMeta(definition.type);
+              return (
+                <button
+                  key={definition.type}
+                  className="floating-node-template"
+                  onClick={() => {
+                    addWorkflowNode(definition.type);
+                    setNodeLibraryOpen(false);
+                  }}
+                  onPointerDown={(event) => {
+                    event.preventDefault();
+                    setDraggingTemplate({
+                      type: definition.type,
+                      icon: meta.icon,
+                      startX: event.clientX,
+                      startY: event.clientY,
+                      x: event.clientX,
+                      y: event.clientY,
+                      moved: false,
+                    });
+                    setNotice(`拖动「${meta.label}」到画布后松开设置位置`);
+                  }}
+                >
+                  <span className="floating-node-icon"><CanvasIcon name={meta.icon} /></span>
+                  <strong>{meta.label}</strong>
+                  {definition.type === "text.input" && <em>Gemini3</em>}
+                  {definition.type === "image.generate" && <em>Neo Image Pro</em>}
+                  <small>{meta.description}</small>
+                </button>
+              );
+            })}
           </div>
           <div className="floating-library-section">临时资源</div>
-          <button className="floating-node-template upload-local" type="button">
-            <span className="floating-node-icon">⇧</span>
-            <strong>上传本地</strong>
-            <small>图片、视频、音频</small>
+          <button className="floating-node-template upload-local" type="button" onClick={() => setAssetLibraryOpen(true)}>
+            <span className="floating-node-icon"><CanvasIcon name="add-asset" /></span>
+            <strong>打开素材空间</strong>
+            <small>图片、视频、音频素材</small>
           </button>
         </div>
       )}
       <div className="floating-dock">
-        <button className={nodeLibraryOpen ? "active" : ""} title="添加节点" onClick={() => setNodeLibraryOpen((open) => !open)}>
-          {nodeLibraryOpen ? "×" : "+"}
+        <button className={nodeLibraryOpen ? "active" : ""} title="添加节点" aria-label="添加节点" onClick={() => setNodeLibraryOpen((open) => !open)}>
+          <CanvasIcon name={nodeLibraryOpen ? "close" : "add-node"} />
         </button>
         <span />
-        <button className={assetLibraryOpen ? "active" : ""} title="素材库" onClick={() => setAssetLibraryOpen((open) => !open)}>库</button>
-        <button title="历史" onClick={undoCanvas}>↶</button>
-        <button title="重做" onClick={redoCanvas}>↷</button>
-        <button title="适配全部" onClick={fitAllNodes}>⌖</button>
+        <button className={assetLibraryOpen ? "active" : ""} title="素材空间" aria-label="素材空间" onClick={() => setAssetLibraryOpen((open) => !open)}><CanvasIcon name="asset-space" /></button>
+        <button title="撤销" aria-label="撤销" onClick={undoCanvas}><CanvasIcon name="undo" /></button>
+        <button title="重做" aria-label="重做" onClick={redoCanvas}><CanvasIcon name="redo" /></button>
+        <button title="适配全部" aria-label="适配全部" onClick={fitAllNodes}><CanvasIcon name="fit" /></button>
         <span />
-        <button title="回到中心" onClick={centerCanvas}>◎</button>
-        <button title="帮助">?</button>
+        <button title="回到中心" aria-label="回到中心" onClick={centerCanvas}><CanvasIcon name="center" /></button>
+        <button title="帮助" aria-label="帮助"><CanvasIcon name="help" /></button>
         <span />
-        <button title="固定">⌖</button>
+        <button title="固定" aria-label="固定"><CanvasIcon name="pin" /></button>
       </div>
       {draggingTemplate && (
         <div className="node-drag-preview" style={{ left: draggingTemplate.x, top: draggingTemplate.y }}>
-          {draggingTemplate.icon}
+          <CanvasIcon name={draggingTemplate.icon} />
         </div>
       )}
       {assetLibraryOpen && (
-        <aside className="asset-drawer">
-          <header>
-            <div>
-              <strong>素材库</strong>
-              <span>{visibleAssetCountText} 个素材</span>
-            </div>
-            <button type="button" onClick={() => setAssetLibraryOpen(false)}>×</button>
-          </header>
-          <div className="asset-filters">
-            {(["all", "image", "audio", "video"] as const).map((type) => (
-              <button key={type} className={assetFilter === type ? "active" : ""} onClick={() => setAssetFilter(type)}>
-                {type === "all" ? "全部" : type === "image" ? "图片" : type === "audio" ? "音频" : "视频"}
-              </button>
-            ))}
-          </div>
-          <div className="asset-grid">
-            {assetLibraryLoading && <div className="asset-empty">正在加载素材…</div>}
-            {!assetLibraryLoading && filteredAssets.length === 0 && <div className="asset-empty">暂无素材，生成或上传后会出现在这里</div>}
-            {filteredAssets.map((asset) => (
-              <article
-                key={asset.id}
-                className="asset-card"
-                draggable
-                onDragStart={(event) => event.dataTransfer.setData("application/x-anime-canvas-asset", asset.id)}
-              >
-                <button className="asset-thumb" type="button" onClick={() => setPreviewAsset(asset)}>
-                  {asset.type === "image" ? <img src={asset.thumbnailUrl || asset.url} alt={asset.name || asset.id} /> : <span>{asset.type === "audio" ? "音频" : "视频"}</span>}
+        <div className="asset-space-overlay" onClick={() => setAssetLibraryOpen(false)}>
+          <section className="asset-drawer asset-space-modal" onClick={(event) => event.stopPropagation()}>
+            <header>
+              <div>
+                <strong>素材空间</strong>
+                <span>{visibleAssetCountText} 个素材</span>
+              </div>
+              <button type="button" title="关闭" aria-label="关闭素材空间" onClick={() => setAssetLibraryOpen(false)}><CanvasIcon name="close" /></button>
+            </header>
+            <div className="asset-filters">
+              {(["all", "image", "audio", "video"] as const).map((type) => (
+                <button key={type} className={assetFilter === type ? "active" : ""} onClick={() => setAssetFilter(type)}>
+                  {type === "all" ? "全部" : type === "image" ? "图片" : type === "audio" ? "音频" : "视频"}
                 </button>
-                <div className="asset-meta">
-                  <strong title={asset.name || asset.url}>{asset.name || asset.url.slice(0, 36)}</strong>
-                  <span>{asset.type} · {asset.source}</span>
-                </div>
-                <div className="asset-actions">
-                  <button type="button" onClick={() => addAssetNode(asset)}>放入画布</button>
-                  <button type="button" onClick={() => copyAssetUrl(asset)}>复制 URL</button>
-                  <button type="button" onClick={() => renameAsset(asset)}>重命名</button>
-                  <button type="button" onClick={() => removeAsset(asset)}>删除</button>
-                </div>
-              </article>
-            ))}
-          </div>
-        </aside>
+              ))}
+            </div>
+            <div className="asset-grid">
+              {assetLibraryLoading && <div className="asset-empty">正在加载素材...</div>}
+              {!assetLibraryLoading && filteredAssets.length === 0 && <div className="asset-empty">暂无素材，生成或上传后会出现在这里</div>}
+              {filteredAssets.map((asset) => (
+                <article
+                  key={asset.id}
+                  className="asset-card"
+                  draggable
+                  onDragStart={(event) => event.dataTransfer.setData("application/x-anime-canvas-asset", asset.id)}
+                >
+                  <button className="asset-thumb" type="button" onClick={() => setPreviewAsset(asset)}>
+                    {asset.type === "image" ? <img src={asset.thumbnailUrl || asset.url} alt={asset.name || asset.id} /> : <span>{asset.type === "audio" ? "音频" : "视频"}</span>}
+                  </button>
+                  <div className="asset-meta">
+                    <strong title={asset.name || asset.url}>{asset.name || asset.url.slice(0, 36)}</strong>
+                    <span>{asset.type} · {asset.source}</span>
+                  </div>
+                  <div className="asset-actions">
+                    <button type="button" onClick={() => addAssetNode(asset)}>放入画布</button>
+                    <button type="button" onClick={() => copyAssetUrl(asset)}>复制 URL</button>
+                    <button type="button" onClick={() => renameAsset(asset)}>重命名</button>
+                    <button type="button" onClick={() => removeAsset(asset)}>删除</button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          </section>
+        </div>
       )}
       {previewAsset && (
         <div className="asset-preview" onClick={() => setPreviewAsset(null)}>
           <div className="asset-preview-card" onClick={(event) => event.stopPropagation()}>
             <header>
               <strong>{previewAsset.name || "素材预览"}</strong>
-              <button type="button" onClick={() => setPreviewAsset(null)}>×</button>
+              <button type="button" title="关闭" aria-label="关闭素材预览" onClick={() => setPreviewAsset(null)}><CanvasIcon name="close" /></button>
             </header>
             {previewAsset.type === "image" && <img src={previewAsset.url} alt={previewAsset.name || previewAsset.id} />}
             {previewAsset.type === "audio" && <audio src={previewAsset.url} controls />}
@@ -2462,7 +3014,7 @@ export function CanvasPage() {
           <div className="asset-preview-card" onClick={(event) => event.stopPropagation()}>
             <header>
               <strong>{previewResult.title}</strong>
-              <button type="button" onClick={() => setPreviewResult(null)}>×</button>
+              <button type="button" title="关闭" aria-label="关闭结果预览" onClick={() => setPreviewResult(null)}><CanvasIcon name="close" /></button>
             </header>
             {previewResult.type === "image" && <img src={previewResult.url} alt={previewResult.title} />}
             {previewResult.type === "audio" && <audio src={previewResult.url} controls />}
@@ -2475,13 +3027,36 @@ export function CanvasPage() {
         </div>
       )}
       {contextMenu && (
-        <div className="canvas-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onClick={() => setContextMenu(null)}>
-          <button type="button" onClick={() => addWorkflowNode("text.input", { x: contextMenu.flowX, y: contextMenu.flowY })}>添加文本节点</button>
-          <button type="button" onClick={() => addWorkflowNode("image.generate", { x: contextMenu.flowX, y: contextMenu.flowY })}>添加图片生成</button>
-          <button type="button" onClick={duplicateSelectedNode} disabled={!selectedNodeId}>复制选中节点</button>
-          <button type="button" onClick={deleteSelected} disabled={!selectedNodeId && !selectedEdgeId && selectionNodeIds.length === 0}>删除选中</button>
-          <button type="button" onClick={fitAllNodes}>适配全部节点</button>
-          <button type="button" onClick={centerCanvas}>回到中心</button>
+        <div
+          className={`canvas-context-menu ${contextMenu.mode === "nodes" ? "nodes" : ""}`}
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          {contextMenu.mode === "actions" ? (
+            <>
+              <button type="button" onClick={() => setContextMenu((current) => current ? { ...current, mode: "nodes" } : current)}><CanvasIcon name="add-node" />添加节点</button>
+              <button type="button" onClick={() => { setAssetLibraryOpen(true); setContextMenu(null); }}><CanvasIcon name="add-asset" />添加资产</button>
+              <button type="button" disabled><CanvasIcon name="paste" />粘贴</button>
+              <div className="context-menu-separator" />
+              <button type="button" onClick={() => { undoCanvas(); setContextMenu(null); }}><CanvasIcon name="undo" />撤销</button>
+              <button type="button" onClick={() => { redoCanvas(); setContextMenu(null); }}><CanvasIcon name="redo" />重做</button>
+            </>
+          ) : (
+            <>
+              {nodeDefinitions.map((definition) => {
+                const meta = getNodeUiMeta(definition.type);
+                return (
+                  <button key={definition.type} type="button" onClick={() => addContextNode(definition.type)}>
+                    <CanvasIcon name={meta.icon} />
+                    <span>
+                      <strong>{meta.label}</strong>
+                      <em>{meta.description}</em>
+                    </span>
+                  </button>
+                );
+              })}
+            </>
+          )}
         </div>
       )}
 
@@ -2489,7 +3064,7 @@ export function CanvasPage() {
         <div className="connection-node-picker nodrag" style={{ left: connectionPicker.x, top: connectionPicker.y }}>
           <div className="connection-node-picker-head">
             <span>{connectionPicker.dragStart.handleType === "source" ? "选择下游节点" : "选择上游节点"}</span>
-            <button type="button" title="关闭" onClick={() => setConnectionPicker(null)}>×</button>
+            <button type="button" title="关闭" onClick={() => setConnectionPicker(null)}>关闭</button>
           </div>
           <div className="connection-node-picker-list">
             {connectionPicker.candidates.length > 0 ? connectionPicker.candidates.map((candidate) => (
@@ -2505,7 +3080,7 @@ export function CanvasPage() {
                 </span>
               </button>
             )) : (
-              <div className="connection-node-picker-empty">没有兼容节点</div>
+              <div className="connection-node-picker-empty">娌℃湁鍏煎鑺傜偣</div>
             )}
           </div>
         </div>
@@ -2536,7 +3111,7 @@ export function CanvasPage() {
           }
           setConnectionPicker(null);
           const flow = screenToFlowPosition({ x: event.clientX, y: event.clientY });
-          setContextMenu({ x: event.clientX, y: event.clientY, flowX: flow.x, flowY: flow.y, nodeId: selectedNodeId || undefined });
+          setContextMenu({ x: event.clientX, y: event.clientY, flowX: flow.x, flowY: flow.y, nodeId: selectedNodeId || undefined, mode: "actions" });
         }}
       >
         <ReactFlow<WorkflowReactNode, WorkflowReactEdge>

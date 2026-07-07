@@ -2,9 +2,66 @@ import { memo, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMou
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { getNodeDefinition } from "../../nodeDefinitions";
 import type { AssetRecord } from "../../types";
-import { getNodeAssetType, getNodeIcon, getNodePreviewText } from "./canvasUtils";
+import { getNodeAssetType, getNodePreviewText } from "./canvasUtils";
 import { getCheckedParamValue, getModelParamConfigs, getParamValue, coerceNodeParamValue, pickPublicParams } from "./modelParams";
 import type { WorkflowReactNode } from "./workflowTypes";
+
+type NodeIconName = "text" | "image" | "audio" | "video" | "preview" | "inspect" | "edit" | "duplicate" | "run" | "retry" | "open" | "close" | "trash";
+
+function NodeIcon({ name }: { name: NodeIconName }) {
+  const common = {
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.85,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    "aria-hidden": true,
+  };
+
+  switch (name) {
+    case "text":
+      return <svg {...common}><path d="M5 6h14M12 6v12M9 18h6" /></svg>;
+    case "image":
+      return <svg {...common}><rect x="4" y="5" width="16" height="14" rx="3" /><path d="m7 16 3-3 2.2 2.2 1.6-1.7L17 16" /><circle cx="15.5" cy="9.5" r="1.2" /></svg>;
+    case "audio":
+      return <svg {...common}><path d="M9 9v6a3 3 0 1 1-2-2.8V7l9-2v8a3 3 0 1 1-2-2.8V6.2L9 7.3" /></svg>;
+    case "video":
+      return <svg {...common}><rect x="4" y="7" width="12" height="10" rx="2" /><path d="m16 11 4-2.5v7L16 13" /></svg>;
+    case "preview":
+      return <svg {...common}><path d="M3 12s3.4-5 9-5 9 5 9 5-3.4 5-9 5-9-5-9-5Z" /><circle cx="12" cy="12" r="2.4" /></svg>;
+    case "inspect":
+      return <svg {...common}><circle cx="11" cy="11" r="6" /><path d="m16 16 4 4" /><path d="M11 8v3l2 1.4" /></svg>;
+    case "edit":
+      return <svg {...common}><path d="m14.5 5.5 4 4L9 19H5v-4L14.5 5.5Z" /><path d="m13 7 4 4" /></svg>;
+    case "duplicate":
+      return <svg {...common}><rect x="8" y="8" width="11" height="11" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1" /></svg>;
+    case "run":
+      return <svg {...common}><path d="M8 5.5v13l10-6.5-10-6.5Z" /></svg>;
+    case "retry":
+      return <svg {...common}><path d="M20 11a8 8 0 0 0-14.4-4.8L4 8" /><path d="M4 4v4h4" /><path d="M4 13a8 8 0 0 0 14 5" /></svg>;
+    case "open":
+      return <svg {...common}><path d="M8 16 16 8" /><path d="M10 8h6v6" /><path d="M5 5v14h14" /></svg>;
+    case "close":
+      return <svg {...common}><path d="M6 6l12 12M18 6 6 18" /></svg>;
+    case "trash":
+      return <svg {...common}><path d="M4 7h16" /><path d="M10 11v6M14 11v6" /><path d="M6 7l1 13h10l1-13" /><path d="M9 7V4h6v3" /></svg>;
+    default:
+      return null;
+  }
+}
+
+function getWorkflowNodeIcon(type: string): NodeIconName {
+  if (type.includes("image")) return "image";
+  if (type.includes("audio")) return "audio";
+  if (type.includes("video")) return "video";
+  return "text";
+}
+
+function getDefaultModelIdForWorkflowType(type: string) {
+  if (type === "video.generate") return "seedance-2-fast";
+  return "z-image-turbo";
+}
 
 function AssetAddRow({
   thumbnails,
@@ -51,22 +108,22 @@ function AssetAddRow({
                     onRemove(index);
                   }}
                 >
-                  ✕
+                  <NodeIcon name="close" />
                 </button>
               )}
             </>
           ) : (
-            <span className="node-add-thumb-icon">{assetLabel === "audio" ? "♪" : assetLabel === "video" ? "▶" : "▣"}</span>
+            <span className="node-add-thumb-icon">{assetLabel === "audio" ? <NodeIcon name="audio" /> : assetLabel === "video" ? <NodeIcon name="video" /> : <NodeIcon name="image" />}</span>
           )}
         </div>
       ))}
       <div className="node-add-wrapper" ref={pickerRef}>
         <div
           className="node-expanded-add"
-          title={`从素材库选择${assetLabel === "image" ? "图片" : assetLabel === "audio" ? "音频" : "视频"}`}
+          title={`从素材空间选择${assetLabel === "image" ? "图片" : assetLabel === "audio" ? "音频" : "视频"}`}
           onClick={() => setPickerOpen((prev) => !prev)}
         >
-          ＋
+          <NodeIcon name="image" />
         </div>
         {pickerOpen && assets.length > 0 && (
           <div className="node-asset-picker">
@@ -81,7 +138,7 @@ function AssetAddRow({
                 {asset.type === "image" ? (
                   <img src={asset.thumbnailUrl || asset.url} alt={asset.mimeType} />
                 ) : (
-                  <span className="node-asset-icon">{asset.type === "audio" ? "♪" : "▶"}</span>
+                  <span className="node-asset-icon">{asset.type === "audio" ? <NodeIcon name="audio" /> : <NodeIcon name="video" />}</span>
                 )}
               </button>
             ))}
@@ -191,7 +248,7 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
   const definition = getNodeDefinition(workflow.type);
   const runtime = workflow.runtime;
   const isGenerate = definition?.category === "generate";
-  const updateData = (patch: Record<string, unknown>, options?: { markLocalEdit?: boolean }) => onPatch(workflow.id, { data: { ...workflow.data, ...patch } }, options);
+  const updateData = (patch: Record<string, unknown>, options?: { markLocalEdit?: boolean }) => onPatch(workflow.id, { data: patch }, options);
   const assetType = getNodeAssetType(workflow.type);
   const visibleAssets = useMemo(
     () => expanded && assetType ? assets.filter((asset) => asset.type === assetType) : [],
@@ -217,8 +274,11 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
   const [mentionOpen, setMentionOpen] = useState(false);
   const [mentionFilter, setMentionFilter] = useState("");
   const promptTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const promptCommitTimerRef = useRef(0);
+  const promptEditingRef = useRef(false);
+  const [promptDraft, setPromptDraft] = useState(String(workflow.data.prompt || ""));
   const canEditPrompt = workflow.type === "text.input" || Boolean(isGenerate);
-  const selectedModel = models.find((m) => m.id === (workflow.data.modelId || "z-image-turbo"));
+  const selectedModel = models.find((m) => m.id === (workflow.data.modelId || getDefaultModelIdForWorkflowType(workflow.type)));
   const requiredParamIssues = isGenerate
     ? getModelParamConfigs(selectedModel)
       .filter((config) => config.required)
@@ -241,6 +301,32 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
   useEffect(() => {
     if (expandedText) setTextDraft(String(workflow.data.prompt || ""));
   }, [expandedText, workflow.data.prompt]);
+
+  useEffect(() => {
+    if (!promptEditingRef.current) setPromptDraft(String(workflow.data.prompt || ""));
+  }, [workflow.id, workflow.data.prompt]);
+
+  useEffect(() => () => {
+    window.clearTimeout(promptCommitTimerRef.current);
+  }, []);
+
+  const schedulePromptCommit = (value: string, options: { markLocalEdit?: boolean } = { markLocalEdit: true }) => {
+    window.clearTimeout(promptCommitTimerRef.current);
+    promptCommitTimerRef.current = window.setTimeout(() => {
+      updateData({
+        prompt: value,
+        ...(isGenerate ? { promptTouched: true } : {}),
+      }, options);
+    }, 360);
+  };
+
+  const commitPromptDraft = (value = promptDraft, options: { markLocalEdit?: boolean } = {}) => {
+    window.clearTimeout(promptCommitTimerRef.current);
+    updateData({
+      prompt: value,
+      ...(isGenerate ? { promptTouched: true } : {}),
+    }, options);
+  };
 
   const stopToolbarEvent = (event: ReactMouseEvent) => {
     event.preventDefault();
@@ -313,7 +399,7 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
         : downstreamNodes.length > 0
           ? "高亮下游节点"
           : "打开节点内容";
-  const primaryActionIcon = runtime.status === "failed" ? "↻" : hasResult && !resultStale ? "↗" : isGenerate ? "▶" : "↗";
+  const primaryActionIcon: NodeIconName = runtime.status === "failed" ? "retry" : hasResult && !resultStale ? "open" : isGenerate ? "run" : "open";
 
   return (
     <div className={`node-card ${selected ? "selected" : ""} ${expanded ? "expanded" : ""} ${runtime.status} ${highlightRole || ""}`} style={{ minHeight: height }}>
@@ -325,7 +411,7 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
           onDelete(workflow.id);
         }}
       >
-        ✕
+        <NodeIcon name="trash" />
       </button>
       {expanded && (
         <div className="node-floating-toolbar nodrag" onMouseDown={(event) => event.stopPropagation()}>
@@ -337,7 +423,7 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
               handlePreviewOrCollapse();
             }}
           >
-            ▣
+            <NodeIcon name="preview" />
           </button>
           <button
             type="button"
@@ -348,7 +434,7 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
               handleInspectInputs();
             }}
           >
-            ◎
+            <NodeIcon name="inspect" />
           </button>
           <button
             type="button"
@@ -359,7 +445,7 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
               openPromptEditor();
             }}
           >
-            T
+            <NodeIcon name="edit" />
           </button>
           <button
             type="button"
@@ -369,7 +455,7 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
               onDuplicate(workflow.id);
             }}
           >
-            ⧉
+            <NodeIcon name="duplicate" />
           </button>
           <button
             type="button"
@@ -380,12 +466,12 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
               handlePrimaryAction();
             }}
           >
-            {primaryActionIcon}
+            <NodeIcon name={primaryActionIcon} />
           </button>
         </div>
       )}
       <div className="node-header">
-        <span className="node-kind-icon">{getNodeIcon(workflow.type)}</span>
+        <span className="node-kind-icon"><NodeIcon name={getWorkflowNodeIcon(workflow.type)} /></span>
         {expanded ? (
           <input
             className="node-title-input"
@@ -415,25 +501,25 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
       <div className="node-preview">
         {hasResult && workflow.type.includes("image") ? (
           <div className="node-preview-img-wrap" style={{ backgroundImage: `url(${workflow.data.resultUrl || workflow.data.url})` }}>
-            <img src={String(workflow.data.resultUrl || workflow.data.url)} alt="节点预览" />
+            <img src={String(workflow.data.resultUrl || workflow.data.url)} alt="鑺傜偣棰勮" />
           </div>
         ) : hasResult && workflow.type.includes("audio") ? (
           <div className="node-empty-preview">
-            <span>♫</span>
+            <span><NodeIcon name="audio" /></span>
             <p>音频已生成</p>
           </div>
         ) : hasResult && workflow.type.includes("video") ? (
           <div className="node-empty-preview">
-            <span>▶</span>
+            <span><NodeIcon name="video" /></span>
             <p>视频已生成</p>
           </div>
         ) : (
           <div className="node-empty-preview">
-            <span>{workflow.type.includes("image") ? "▣" : workflow.type.includes("audio") ? "♪" : workflow.type.includes("video") ? "▶" : "Aa"}</span>
+            <span>{workflow.type.includes("image") ? <NodeIcon name="image" /> : workflow.type.includes("audio") ? <NodeIcon name="audio" /> : workflow.type.includes("video") ? <NodeIcon name="video" /> : <NodeIcon name="text" />}</span>
             <p>{previewText}</p>
           </div>
         )}
-        <i className="node-resize-mark">⌟</i>
+        <i className="node-resize-mark">?</i>
       </div>
       {hasResult && (
         <div className="node-result-actions nodrag">
@@ -449,7 +535,7 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
         <div className={`node-diagnostics nodrag ${diagnosticIssues.length > 0 ? "has-issues" : "ready"}`} onClick={(event) => event.stopPropagation()}>
           <div className="node-diagnostics-head">
             <strong>输入诊断</strong>
-            <span>{diagnosticIssues.length > 0 ? `${diagnosticIssues.length} 个待处理项` : "可以运行"}</span>
+            <span>{diagnosticIssues.length > 0 ? `${diagnosticIssues.length} 项需要处理` : "检查通过"}</span>
           </div>
           <div className="node-diagnostics-grid">
             <div>
@@ -465,7 +551,7 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
               <strong>{connectedInputs.images.length}</strong>
             </div>
             <div>
-              <span>媒体</span>
+              <span>濯掍綋</span>
               <strong>{connectedInputs.audios.length + connectedInputs.videos.length}</strong>
             </div>
           </div>
@@ -535,7 +621,7 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
                 onSelect={(url) => {
                   const asset = imageAssets.find((a) => a.url === url);
                   updateData({
-                    refImages: [...refImages, { url, name: asset?.name || `参考图${refImages.length + 1}` }],
+                    refImages: [...refImages, { url, name: asset?.name || `鍙傝€冨浘${refImages.length + 1}` }],
                   });
                 }}
                 onRemove={(index) => {
@@ -548,7 +634,6 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
           })()}
           <div className="node-body node-editor-body">
         {workflow.type === "text.input" && (() => {
-          const initialText = String(workflow.data.prompt || "");
           const templates = ["角色设定：", "场景描述：", "镜头语言：", "情绪氛围："];
           return (
             <div className="node-textarea-wrap">
@@ -560,32 +645,42 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
                     onClick={(event) => {
                       const textarea = event.currentTarget.closest(".node-textarea-wrap")?.querySelector("textarea");
                       if (!textarea) return;
-                      textarea.value = `${textarea.value}${textarea.value ? "\n" : ""}${template}`;
-                      updateData({ prompt: textarea.value });
+                      const nextValue = `${textarea.value}${textarea.value ? "\n" : ""}${template}`;
+                      setPromptDraft(nextValue);
+                      commitPromptDraft(nextValue, { markLocalEdit: true });
+                      requestAnimationFrame(() => textarea.focus());
                     }}
                   >
-                    {template.replace("：", "")}
+                    {template.replace("?", "")}
                   </button>
                 ))}
               </div>
               <textarea
                 className="node-inline-textarea nodrag"
-                value={initialText}
-                placeholder="请输入提示词，可分行描述角色、场景、镜头、风格"
-                onChange={(event) => updateData({ prompt: event.currentTarget.value }, { markLocalEdit: true })}
-                onBlur={(event) => updateData({ prompt: event.target.value })}
+                value={promptDraft}
+                placeholder="请输入提示词，可分行描述角色、场景、镜头和风格"
+                onFocus={() => {
+                  promptEditingRef.current = true;
+                }}
+                onChange={(event) => {
+                  const value = event.currentTarget.value;
+                  setPromptDraft(value);
+                  schedulePromptCommit(value, { markLocalEdit: true });
+                }}
+                onBlur={(event) => {
+                  promptEditingRef.current = false;
+                  commitPromptDraft(event.currentTarget.value);
+                }}
               />
               <button
                 className="node-textarea-expand"
-                title="放大编辑"
+                title="鏀惧ぇ缂栬緫"
                 onClick={() => setExpandedText(true)}
               >
-                ⤢
-              </button>
+                鉀?              </button>
             </div>
           );
-        })()}
-        {workflow.type === "audio.input" && Boolean(workflow.data.url) && (
+        })()}        {workflow.type === "audio.input" && Boolean(workflow.data.url) && (
           <div className="node-media-preview">
             <audio controls src={String(workflow.data.url)} style={{ width: "100%" }} />
           </div>
@@ -607,7 +702,8 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
             const before = textarea.value.slice(0, atIndex);
             const after = textarea.value.slice(cursorPos);
             const newValue = `${before}@${ref.name}${after}`;
-            textarea.value = newValue;
+            setPromptDraft(newValue);
+            commitPromptDraft(newValue, { markLocalEdit: true });
             setMentionOpen(false);
             requestAnimationFrame(() => {
               const newPos = before.length + ref.name.length + 1;
@@ -619,13 +715,15 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
           const handleBlur = () => {
             const textarea = promptTextareaRef.current;
             if (!textarea) return;
-            updateData({ prompt: textarea.value, promptTouched: true });
+            promptEditingRef.current = false;
+            commitPromptDraft(textarea.value);
           };
 
-          const handleInput = (event: React.FormEvent<HTMLTextAreaElement>) => {
-            const value = (event.target as HTMLTextAreaElement).value;
-            updateData({ prompt: value, promptTouched: true }, { markLocalEdit: true });
-            const cursorPos = (event.target as HTMLTextAreaElement).selectionStart;
+          const handleInput = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
+            const value = event.currentTarget.value;
+            setPromptDraft(value);
+            schedulePromptCommit(value, { markLocalEdit: true });
+            const cursorPos = event.currentTarget.selectionStart;
             const textBeforeCursor = value.slice(0, cursorPos);
             const atMatch = textBeforeCursor.match(/@(\w*)$/);
             if (atMatch) {
@@ -635,8 +733,6 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
               setMentionOpen(false);
             }
           };
-
-          const fullText = String(workflow.data.prompt || "");
 
           const filteredRefs = refImages.filter((ref) =>
             ref.name.toLowerCase().includes(mentionFilter),
@@ -658,8 +754,10 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
                       onClick={() => {
                         const textarea = promptTextareaRef.current;
                         if (!textarea) return;
-                        textarea.value = `${textarea.value}${textarea.value ? ", " : ""}${template}`;
-                        updateData({ prompt: textarea.value, promptTouched: true });
+                        const nextValue = `${textarea.value}${textarea.value ? ", " : ""}${template}`;
+                        setPromptDraft(nextValue);
+                        commitPromptDraft(nextValue, { markLocalEdit: true });
+                        requestAnimationFrame(() => textarea.focus());
                       }}
                     >
                       {template.split(" ").slice(0, 2).join(" ")}
@@ -671,8 +769,10 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
                       onClick={() => {
                         const textarea = promptTextareaRef.current;
                         if (!textarea) return;
-                        textarea.value = `${textarea.value}${textarea.value ? "\n" : ""}${inputText}`;
-                        updateData({ prompt: textarea.value, promptTouched: true });
+                        const nextValue = `${textarea.value}${textarea.value ? "\n" : ""}${inputText}`;
+                        setPromptDraft(nextValue);
+                        commitPromptDraft(nextValue, { markLocalEdit: true });
+                        requestAnimationFrame(() => textarea.focus());
                       }}
                     >
                       插入上游文本
@@ -682,9 +782,12 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
                 <textarea
                   ref={promptTextareaRef}
                   className="node-inline-textarea node-prompt-textarea"
-                  defaultValue={fullText}
+                  value={promptDraft}
                   placeholder={refImages.length > 0 ? "输入提示词，使用 @ 引用参考图..." : "请先在上方添加参考图，然后输入提示词"}
-                  onInput={handleInput}
+                  onFocus={() => {
+                    promptEditingRef.current = true;
+                  }}
+                  onChange={handleInput}
                   onBlur={handleBlur}
                 />
                 {mentionOpen && filteredRefs.length > 0 && (
@@ -831,7 +934,7 @@ function WorkflowCard({ data, selected }: NodeProps<WorkflowReactNode>) {
               >
                 保存
               </button>
-              <button type="button" onClick={() => setExpandedText(false)}>✕</button>
+              <button type="button" onClick={() => setExpandedText(false)}><NodeIcon name="close" /></button>
             </div>
           </div>
           <textarea

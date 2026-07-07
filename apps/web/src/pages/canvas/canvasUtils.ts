@@ -346,7 +346,7 @@ export function hasSnapshotContent(snapshot: CanvasSnapshot | null | undefined) 
   );
 }
 
-export function readLocalSnapshot(): CanvasSnapshot {
+export function readLocalSnapshot(storageKey = LOCAL_SNAPSHOT_KEY): CanvasSnapshot {
   const fallback: CanvasSnapshot = {
     nodes: [
       makeWorkflowNode("text.input", { x: 120, y: 160 }),
@@ -356,7 +356,7 @@ export function readLocalSnapshot(): CanvasSnapshot {
     groups: [],
     viewport: { x: 0, y: 0, zoom: 1 },
   };
-  const raw = localStorage.getItem(LOCAL_SNAPSHOT_KEY);
+  const raw = localStorage.getItem(storageKey) || localStorage.getItem(LOCAL_SNAPSHOT_KEY);
   if (!raw) return fallback;
   try {
     const snapshot = JSON.parse(raw) as CanvasSnapshot;

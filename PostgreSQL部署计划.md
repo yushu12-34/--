@@ -29,7 +29,7 @@ Nginx / Caddy / 直接 Node API
         v
 Node API 服务
         |
-        | 127.0.0.1:5432 或 Docker 内网
+        | 127.0.0.1:5433 或 Docker 内网
         v
 PostgreSQL
 ```
@@ -37,7 +37,7 @@ PostgreSQL
 端口建议：
 
 - 对外只开放一个开发入口端口，例如 `18080` 或反向代理后的 `443`。
-- PostgreSQL `5432` 仅监听 `127.0.0.1` 或 Docker 内网，不对公网开放。
+- PostgreSQL `5433` 仅监听 `127.0.0.1` 或 Docker 内网，不对公网开放。
 - Web/Admin/API 可以先继续使用本项目现有端口，但正式给用户访问时建议只通过一个反向代理入口。
 - 临时开发访问推荐 SSH 隧道：
 
@@ -78,7 +78,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       TZ: Asia/Shanghai
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:5433:5433"
     volumes:
       - ./postgres/data:/var/lib/postgresql/data
       - ./postgres/backups:/backups
@@ -117,7 +117,7 @@ POSTGRES_PASSWORD=替换为强密码
 
 ```env
 DATA_BACKEND=postgres
-DATABASE_URL=postgresql://anime_canvas_app:强密码@127.0.0.1:5432/anime_canvas
+DATABASE_URL=postgresql://anime_canvas_app:强密码@127.0.0.1:5433/anime_canvas
 USER_FINGERPRINT_SECRET=替换为至少32字节随机密钥
 TRUST_PROXY=true
 API_PORT=8787
@@ -423,7 +423,7 @@ pg_restore \
 
 服务器侧：
 
-- 防火墙禁止公网访问 `5432`。
+- 防火墙禁止公网访问 `5433`。
 - 应用端口只允许内测 IP、VPN、SSH 隧道或反向代理认证访问。
 - PostgreSQL 应用账号不使用超级用户。
 - `.env` 权限限制为应用运行用户可读。
@@ -477,7 +477,7 @@ pg_restore \
 
 ## 12. 验收清单
 
-- PostgreSQL `5432` 不公网暴露。
+- PostgreSQL `5433` 不公网暴露。
 - API 可以通过指定开发端口访问。
 - 新用户访问会生成独立用户记录和指纹哈希。
 - 不同用户只能看到自己的项目，或被授权加入的项目。

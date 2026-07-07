@@ -50,6 +50,13 @@ function withAuthHeaders(provider) {
   return headers;
 }
 
+function attachHttpStatus(error, response, payload) {
+  error.status = response.status;
+  error.statusText = response.statusText;
+  error.payload = payload;
+  return error;
+}
+
 async function fetchJson(url, options = {}, timeoutMs = 30000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -66,14 +73,17 @@ async function fetchJson(url, options = {}, timeoutMs = 30000) {
     try {
       payload = text ? JSON.parse(text) : {};
     } catch {
+      if (!response.ok) {
+        throw attachHttpStatus(new Error(text || `${response.status} ${response.statusText}`), response, payload);
+      }
       throw new Error("模型接口返回非 JSON 响应");
     }
     if (!response.ok) {
       const message = payload.detail || payload.error || `${response.status} ${response.statusText}`;
-      if (response.status === 401 || response.status === 403) {
-        throw new Error(`模型接口鉴权失败：HTTP ${response.status} ${message}`);
-      }
-      throw new Error(message);
+      const httpErrorMessage = response.status === 401 || response.status === 403
+        ? `模型接口鉴权失败：HTTP ${response.status} ${message}`
+        : message;
+      throw attachHttpStatus(new Error(httpErrorMessage), response, payload);
     }
     return payload;
   } finally {
@@ -87,6 +97,23 @@ function buildImagePayload(model, input) {
     ...(input.params || {}),
     prompt: input.prompt,
   };
+}
+
+function compactPayload(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => compactPayload(item))
+      .filter((item) => item !== undefined);
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .map(([key, item]) => [key, compactPayload(item)])
+        .filter(([, item]) => item !== undefined),
+    );
+  }
+  if (value === undefined || value === null || value === "") return undefined;
+  return value;
 }
 
 function normalizeHttpMethod(method, fallback = "POST") {
@@ -130,6 +157,8 @@ function buildAdapterContext(model, input, extra = {}) {
     params,
     prompt: input.prompt,
     images: Array.isArray(input.images) ? input.images : [],
+    audios: Array.isArray(input.audios) ? input.audios : [],
+    videos: Array.isArray(input.videos) ? input.videos : [],
     ...extra,
   };
 }
@@ -174,6 +203,10 @@ function normalizeImageUrl(baseUrl, url) {
   return joinUrl(baseUrl, url);
 }
 
+function normalizeResultUrl(baseUrl, url) {
+  return normalizeImageUrl(baseUrl, url);
+}
+
 export function createMockImageResult(input) {
   const prompt = String(input.prompt || "anime scene").slice(0, 120);
   const escaped = prompt
@@ -204,41 +237,181 @@ export function createMockImageResult(input) {
 }
 
 export async function generateImageWithModel(provider, model, input, onProgress) {
+  return generateMediaWithModel(provider, model, input, onProgress, "image");
+}
+
+export async function generateVideoWithModel(provider, model, input, onProgress) {
+  return generateMediaWithModel(provider, model, input, onProgress, "video");
+}
+
+export async function generateMediaWithModel(provider, model, input, onProgress, mediaType = "image") {
   if (!provider.enabled) throw new Error("模型供应商已禁用");
   if (!model.enabled) throw new Error("模型已禁用");
-  if (!input.prompt) throw new Error("缺少提示词输入");
 
   const adapter = model.adapter || {};
+  const hasPrompt = Boolean(String(input.prompt || "").trim());
+  const hasMediaInput = ["images", "audios", "videos"].some((key) => Array.isArray(input[key]) && input[key].length > 0);
+  if (!hasPrompt && (mediaType !== "video" || !hasMediaInput)) throw new Error("缺少提示词输入");
+
+  if (mediaType === "video") {
+    if (adapter.kind === "seedance-video") return generateWithSeedanceVideo(provider, model, input, onProgress);
+    if (adapter.kind === "custom-http") return generateWithCustomHttp(provider, model, input, onProgress, "video");
+    throw new Error(`不支持的视频模型适配器：${adapter.kind || "unknown"}`);
+  }
+
   if (adapter.kind === "sd-webui") return generateWithSdWebui(provider, model, input, onProgress);
-  if (adapter.kind === "custom-http") return generateWithCustomHttp(provider, model, input, onProgress);
+  if (adapter.kind === "custom-http") return generateWithCustomHttp(provider, model, input, onProgress, "image");
   if (adapter.kind === "z-image-turbo" || adapter.kind === "z-image") return generateWithZImage(provider, model, input, onProgress);
   throw new Error(`不支持的模型适配器：${adapter.kind || "unknown"}`);
+}
+
+function buildSeedanceContent(input) {
+  const content = [];
+  const prompt = String(input.prompt || "").trim();
+  if (prompt) content.push({ type: "text", text: prompt });
+
+  for (const url of Array.isArray(input.images) ? input.images : []) {
+    if (!url) continue;
+    content.push({ type: "image_url", image_url: { url: String(url) }, role: "reference_image" });
+  }
+  for (const url of Array.isArray(input.videos) ? input.videos : []) {
+    if (!url) continue;
+    content.push({ type: "video_url", video_url: { url: String(url) }, role: "reference_video" });
+  }
+  for (const url of Array.isArray(input.audios) ? input.audios : []) {
+    if (!url) continue;
+    content.push({ type: "audio_url", audio_url: { url: String(url) }, role: "reference_audio" });
+  }
+  return content;
+}
+
+function buildSeedanceVideoPayload(model, input) {
+  const params = {
+    ...(model.defaultParams || {}),
+    ...(input.params || {}),
+  };
+  const tools = params.web_search ? [{ type: "web_search" }] : undefined;
+  delete params.web_search;
+  return compactPayload({
+    ...params,
+    tools,
+    content: buildSeedanceContent(input),
+  });
+}
+
+async function generateWithSeedanceVideo(provider, model, input, onProgress) {
+  const adapter = model.adapter || {};
+  const timeoutMs = Number(adapter.timeoutMs || provider.timeoutSeconds * 1000 || 600000);
+  const submitPayload = buildSeedanceVideoPayload(model, input);
+  if (!Array.isArray(submitPayload.content) || submitPayload.content.length === 0) {
+    throw new Error("缺少视频生成输入内容");
+  }
+
+  const submitResult = await fetchJson(
+    joinUrl(provider.baseUrl, adapter.submitPath || "/contents/generations/tasks"),
+    {
+      method: normalizeHttpMethod(adapter.submitMethod || adapter.method, "POST"),
+      headers: withAuthHeaders(provider),
+      body: JSON.stringify(submitPayload),
+    },
+    Number(provider.timeoutSeconds || 30) * 1000,
+  );
+  if (onProgress) await onProgress(30);
+
+  const providerTaskId = getByPath(submitResult, adapter.taskIdPath || "id") || submitResult.id;
+  const taskPathTemplate = adapter.taskPathTemplate || adapter.pollPathTemplate || adapter.pollingPathTemplate || "/contents/generations/tasks/{task_id}";
+  if (!providerTaskId) throw new Error(`字段映射错误：提交响应未能通过 ${adapter.taskIdPath || "id"} 读取任务 ID`);
+
+  const startedAt = Date.now();
+  const pollIntervalMs = Number(adapter.pollIntervalMs || 10000);
+  const statusPath = adapter.statusPath || "status";
+  const successStatuses = normalizeStatusValues(adapter.successStatusValues || adapter.successStatus || adapter.successStatusValue, ["succeeded"]);
+  const failureStatuses = normalizeStatusValues(adapter.failureStatusValues || adapter.failureStatus || adapter.failureStatusValue, ["failed", "cancelled", "expired"]);
+
+  while (Date.now() - startedAt < timeoutMs) {
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    const taskPath = renderTemplateString(taskPathTemplate, {
+      ...buildAdapterContext(model, input, { submitResult }),
+      providerTaskId,
+      taskId: providerTaskId,
+      task_id: providerTaskId,
+    });
+    const taskResult = await fetchJson(joinUrl(provider.baseUrl, taskPath), {
+      method: normalizeHttpMethod(adapter.pollMethod, "GET"),
+      headers: withAuthHeaders(provider),
+    }, Number(provider.timeoutSeconds || 30) * 1000);
+
+    if (onProgress) {
+      const elapsed = Date.now() - startedAt;
+      const progress = Math.min(95, 30 + Math.floor((elapsed / timeoutMs) * 65));
+      await onProgress(progress);
+    }
+
+    const status = String(getByPath(taskResult, statusPath) || "").toLowerCase();
+    if (successStatuses.includes(status)) return resolveCustomMediaResult(provider, adapter, taskResult, providerTaskId, "video");
+    if (failureStatuses.includes(status)) throw new Error(`模型任务失败：${readMappedError(taskResult, adapter)}`);
+  }
+
+  throw new Error(`模型任务超时：${providerTaskId}`);
 }
 
 async function generateWithZImage(provider, model, input, onProgress) {
   const adapter = model.adapter || {};
   const timeoutMs = Number(adapter.timeoutMs || provider.timeoutSeconds * 1000 || 120000);
+  const submitPayload = compactPayload(buildCustomRequestPayload(adapter, model, input));
   const submitResult = await fetchJson(
     joinUrl(provider.baseUrl, adapter.submitPath || "/v1/images/generations"),
     {
-      method: "POST",
+      method: normalizeHttpMethod(adapter.submitMethod || adapter.method, "POST"),
       headers: withAuthHeaders(provider),
-      body: JSON.stringify(buildImagePayload(model, input)),
+      body: JSON.stringify(submitPayload),
     },
     Number(provider.timeoutSeconds || 30) * 1000,
   );
-  const providerTaskId = submitResult.task_id;
-  if (!providerTaskId) throw new Error("模型接口未返回 task_id");
+  if (onProgress) await onProgress(35);
+
+  const taskPathTemplate = adapter.taskPathTemplate || adapter.pollPathTemplate || adapter.pollingPathTemplate;
+  const providerTaskId = getByPath(submitResult, adapter.taskIdPath || "task_id") || submitResult.task_id;
+  if (!providerTaskId) return resolveCustomImageResult(provider, adapter, submitResult);
+  if (!taskPathTemplate) return resolveCustomImageResult(provider, adapter, submitResult, providerTaskId);
 
   const startedAt = Date.now();
   const pollIntervalMs = Number(adapter.pollIntervalMs || 2000);
+  const taskNotFoundRetryMs = Number(adapter.taskNotFoundRetryMs || 60000);
+  const statusPath = adapter.statusPath || "status";
+  const successStatuses = normalizeStatusValues(
+    adapter.successStatusValues || adapter.successStatus || adapter.successStatusValue,
+    ["finished", "succeeded", "success", "completed", "done"],
+  );
+  const failureStatuses = normalizeStatusValues(
+    adapter.failureStatusValues || adapter.failureStatus || adapter.failureStatusValue,
+    ["failed", "failure", "error", "cancelled"],
+  );
   while (Date.now() - startedAt < timeoutMs) {
     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-    const taskPath = String(adapter.taskPathTemplate || "/v1/tasks/{task_id}").replace("{task_id}", providerTaskId);
-    const taskResult = await fetchJson(joinUrl(provider.baseUrl, taskPath), {
-      method: "GET",
-      headers: withAuthHeaders(provider),
-    }, Number(provider.timeoutSeconds || 30) * 1000);
+    const taskPath = renderTemplateString(taskPathTemplate, {
+      ...buildAdapterContext(model, input, { submitResult }),
+      providerTaskId,
+      taskId: providerTaskId,
+      task_id: providerTaskId,
+    });
+    let taskResult;
+    try {
+      taskResult = await fetchJson(joinUrl(provider.baseUrl, taskPath), {
+        method: normalizeHttpMethod(adapter.pollMethod, "GET"),
+        headers: withAuthHeaders(provider),
+      }, Number(provider.timeoutSeconds || 30) * 1000);
+    } catch (error) {
+      if (error?.status === 404 && adapter.retryTaskNotFound !== false && Date.now() - startedAt < taskNotFoundRetryMs) {
+        if (onProgress) {
+          const elapsed = Date.now() - startedAt;
+          const progress = Math.min(80, 30 + Math.floor((elapsed / timeoutMs) * 50));
+          await onProgress(progress);
+        }
+        continue;
+      }
+      throw error;
+    }
 
     if (onProgress) {
       const elapsed = Date.now() - startedAt;
@@ -246,22 +419,15 @@ async function generateWithZImage(provider, model, input, onProgress) {
       await onProgress(progress);
     }
 
-    if (taskResult.status === "finished") {
-      const b64 = getByPath(taskResult, adapter.b64Path || "data.0.b64_json");
-      const rawUrl = getByPath(taskResult, adapter.resultPath || "data.0.url");
-      const imageUrl = b64
-        ? `data:image/png;base64,${b64}`
-        : normalizeImageUrl(provider.baseUrl, rawUrl);
-      if (!imageUrl) throw new Error("模型任务完成但未返回图片");
-      return { providerTaskId, url: imageUrl, raw: taskResult };
-    }
-    if (taskResult.status === "failed") throw new Error(taskResult.error || "模型任务失败");
+    const status = String(getByPath(taskResult, statusPath) || "").toLowerCase();
+    if (successStatuses.includes(status)) return resolveCustomImageResult(provider, adapter, taskResult, providerTaskId);
+    if (failureStatuses.includes(status)) throw new Error(readMappedError(taskResult, adapter));
   }
 
   throw new Error(`模型任务超时：${providerTaskId}`);
 }
 
-async function generateWithCustomHttp(provider, model, input, onProgress) {
+async function generateWithCustomHttp(provider, model, input, onProgress, mediaType = "image") {
   const adapter = model.adapter || {};
   const submitMethod = normalizeHttpMethod(adapter.submitMethod || adapter.method, "POST");
   const submitContext = buildAdapterContext(model, input);
@@ -280,7 +446,7 @@ async function generateWithCustomHttp(provider, model, input, onProgress) {
   if (onProgress) await onProgress(35);
 
   const taskPathTemplate = adapter.taskPathTemplate || adapter.pollPathTemplate || adapter.pollingPathTemplate;
-  if (!taskPathTemplate) return resolveCustomImageResult(provider, adapter, submitResult);
+  if (!taskPathTemplate) return resolveCustomMediaResult(provider, adapter, submitResult, undefined, mediaType);
 
   const providerTaskId = getByPath(submitResult, adapter.taskIdPath || "task_id");
   if (!providerTaskId) throw new Error(`字段映射错误：提交响应未能通过 ${adapter.taskIdPath || "task_id"} 读取任务 ID`);
@@ -322,7 +488,7 @@ async function generateWithCustomHttp(provider, model, input, onProgress) {
     }
 
     const status = String(getByPath(taskResult, statusPath) || "").toLowerCase();
-    if (successStatuses.includes(status)) return resolveCustomImageResult(provider, adapter, taskResult, providerTaskId);
+    if (successStatuses.includes(status)) return resolveCustomMediaResult(provider, adapter, taskResult, providerTaskId, mediaType);
     if (failureStatuses.includes(status)) throw new Error(`模型任务失败：${readMappedError(taskResult, adapter)}`);
   }
 
@@ -338,17 +504,22 @@ function readMappedError(result, adapter) {
 }
 
 function resolveCustomImageResult(provider, adapter, result, providerTaskId) {
+  return resolveCustomMediaResult(provider, adapter, result, providerTaskId, "image");
+}
+
+function resolveCustomMediaResult(provider, adapter, result, providerTaskId, mediaType = "image") {
   const b64Path = adapter.b64Path || adapter.base64Path || "data.0.b64_json";
-  const resultPath = adapter.resultPath || adapter.imageUrlPath || "data.0.url";
+  const resultPath = adapter.resultPath || adapter.imageUrlPath || adapter.videoUrlPath || (mediaType === "video" ? "content.video_url" : "data.0.url");
   const b64 = getByPath(result, b64Path);
   const rawUrl = getByPath(result, resultPath);
-  const imageUrl = b64
+  const resultUrl = b64
     ? `data:image/png;base64,${b64}`
-    : normalizeImageUrl(provider.baseUrl, rawUrl);
-  if (!imageUrl) {
-    throw new Error(`字段映射错误：未能通过 ${resultPath} 或 ${b64Path} 读取图片结果`);
+    : normalizeResultUrl(provider.baseUrl, rawUrl);
+  if (!resultUrl) {
+    const fallbackPath = mediaType === "image" ? ` 或 ${b64Path}` : "";
+    throw new Error(`字段映射错误：未能通过 ${resultPath}${fallbackPath} 读取${mediaType === "video" ? "视频" : "图片"}结果`);
   }
-  return { providerTaskId, url: imageUrl, raw: result };
+  return { providerTaskId, url: resultUrl, raw: result, mediaType };
 }
 
 async function generateWithSdWebui(provider, model, input, onProgress) {

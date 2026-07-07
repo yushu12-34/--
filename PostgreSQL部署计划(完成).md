@@ -29,7 +29,7 @@ Nginx / Caddy / 直接 Node API
         v
 Node API 服务
         |
-        | 127.0.0.1:5432 或 Docker 内网
+        | 127.0.0.1:5433 或 Docker 内网
         v
 PostgreSQL
 ```
@@ -37,7 +37,7 @@ PostgreSQL
 端口建议：
 
 - 对外只开放一个开发入口端口，例如 `18080` 或反向代理后的 `443`。
-- PostgreSQL `5432` 仅监听 `127.0.0.1` 或 Docker 内网，不对公网开放。
+- PostgreSQL `5433` 仅监听 `127.0.0.1` 或 Docker 内网，不对公网开放。
 - Web/Admin/API 可以先继续使用本项目现有端口，但正式给用户访问时建议只通过一个反向代理入口。
 - 临时开发访问推荐 SSH 隧道：
 
@@ -80,7 +80,7 @@ services:
       APP_DB_PASSWORD: ${APP_DB_PASSWORD}
       TZ: Asia/Shanghai
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:5433:5433"
     volumes:
       - ./postgres/data:/var/lib/postgresql/data
       - ./postgres/backups:/backups
@@ -120,7 +120,7 @@ APP_DB_PASSWORD=替换为强应用账号密码
 
 ```env
 DATA_BACKEND=postgres
-DATABASE_URL=postgresql://anime_canvas_app:强密码@127.0.0.1:5432/anime_canvas
+DATABASE_URL=postgresql://anime_canvas_app:强密码@127.0.0.1:5433/anime_canvas
 USER_FINGERPRINT_SECRET=替换为至少32字节随机密钥
 TRUST_PROXY=true
 API_PORT=8787
@@ -426,7 +426,7 @@ pg_restore \
 
 服务器侧：
 
-- 防火墙禁止公网访问 `5432`。
+- 防火墙禁止公网访问 `5433`。
 - 应用端口只允许内测 IP、VPN、SSH 隧道或反向代理认证访问。
 - PostgreSQL 应用账号不使用超级用户。
 - `.env` 权限限制为应用运行用户可读。
@@ -446,7 +446,7 @@ pg_restore \
 
 ```text
 postgres-service/
-  docker-compose.yml          # PostgreSQL 16 服务，默认只绑定 127.0.0.1:5432
+  docker-compose.yml          # PostgreSQL 16 服务，默认只绑定 127.0.0.1:5433
   .env.example                # 环境变量模板，复制为 .env 后修改密钥
   init/
     000_create_app_user.sh     # 创建非超级应用数据库账号
@@ -478,7 +478,7 @@ APP_DB_PASSWORD=替换为强应用账号密码
 USER_FINGERPRINT_SECRET=替换为至少32字节随机密钥
 INTERNAL_ADMIN_TOKEN=替换为强随机token
 POSTGRES_BIND_HOST=127.0.0.1
-POSTGRES_PORT=5432
+POSTGRES_PORT=5433
 ```
 
 启动：
@@ -492,23 +492,23 @@ docker compose up -d
 
 ```env
 DATA_BACKEND=postgres
-DATABASE_URL=postgresql://anime_canvas_app:真实密码@127.0.0.1:5432/anime_canvas
+DATABASE_URL=postgresql://anime_canvas_app:真实密码@127.0.0.1:5433/anime_canvas
 ```
 
 如果 PostgreSQL 在服务器上，而后端程序运行在局域网内另一台客户端机器上，采用“局域网开放、公网禁止”的方式：
 
 1. `POSTGRES_BIND_HOST` 绑定服务器局域网 IP，例如 `192.168.50.10`，不要绑定公网 IP。
-2. Docker 端口映射使用 `192.168.50.10:5432:5432`，不要使用公网地址。
-3. 服务器系统防火墙只允许客户端后端机器的局域网 IP 访问 `5432`。
-4. 云防火墙或路由器端口转发不要开放 `5432` 到公网。
+2. Docker 端口映射使用 `192.168.50.10:5433:5433`，不要使用公网地址。
+3. 服务器系统防火墙只允许客户端后端机器的局域网 IP 访问 `5433`。
+4. 云防火墙或路由器端口转发不要开放 `5433` 到公网。
 5. 客户端后端程序的 `DATABASE_URL` 使用数据库服务器局域网 IP。
 
 示例：
 
 ```env
 POSTGRES_BIND_HOST=192.168.50.10
-POSTGRES_PORT=5432
-DATABASE_URL=postgresql://anime_canvas_app:真实密码@192.168.50.10:5432/anime_canvas
+POSTGRES_PORT=5433
+DATABASE_URL=postgresql://anime_canvas_app:真实密码@192.168.50.10:5433/anime_canvas
 ```
 
 如果有多台后端机器访问 PostgreSQL，应在防火墙中逐台加入允许规则，而不是放开整个网段。前端浏览器不能直连 PostgreSQL，必须只通过后端 API 访问数据。
@@ -579,7 +579,7 @@ select set_config('app.current_user_id', $1, true);
 
 ```env
 DATA_BACKEND=postgres
-DATABASE_URL=postgresql://anime_canvas_app:真实密码@服务器局域网IP:5432/anime_canvas
+DATABASE_URL=postgresql://anime_canvas_app:真实密码@服务器局域网IP:5433/anime_canvas
 USER_FINGERPRINT_SECRET=替换为至少32字节随机密钥
 ```
 
@@ -598,7 +598,7 @@ $env:POSTGRES_DRY_RUN_STRICT="true"; npm run postgres:dry-run
 客户端后端机器到服务器 PostgreSQL 的只读连通性检查：
 
 ```powershell
-$env:DATABASE_URL="postgresql://anime_canvas_app:真实密码@服务器局域网IP:5432/anime_canvas"; npm run postgres:smoke
+$env:DATABASE_URL="postgresql://anime_canvas_app:真实密码@服务器局域网IP:5433/anime_canvas"; npm run postgres:smoke
 ```
 
 ### 7C-1V：JSON 到 PostgreSQL 迁移脚本
@@ -612,7 +612,7 @@ $env:DATABASE_URL="postgresql://anime_canvas_app:真实密码@服务器局域网
 
 ```powershell
 # 1. 只读检查数据库连通性和表结构
-$env:DATABASE_URL="postgresql://anime_canvas_app:真实密码@服务器局域网IP:5432/anime_canvas"; npm run postgres:smoke
+$env:DATABASE_URL="postgresql://anime_canvas_app:真实密码@服务器局域网IP:5433/anime_canvas"; npm run postgres:smoke
 
 # 2. 检查当前 db.json 映射风险
 npm run postgres:dry-run
@@ -653,7 +653,7 @@ npm run postgres:migrate -- --apply --confirm replace-postgres --allow-non-empty
 
 ## 13. 验收清单
 
-- PostgreSQL `5432` 不公网暴露。
+- PostgreSQL `5433` 不公网暴露。
 - API 可以通过指定开发端口访问。
 - 新用户访问会生成独立用户记录和指纹哈希。
 - 不同用户只能看到自己的项目，或被授权加入的项目。

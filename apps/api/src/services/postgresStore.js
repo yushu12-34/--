@@ -1,3 +1,5 @@
+import { resolveStoredAssetUrl } from "./storageService.js";
+
 export const REQUIRED_TABLES = [
   "users",
   "user_devices",
@@ -12,6 +14,8 @@ export const REQUIRED_TABLES = [
   "system_events",
   "yjs_updates",
   "yjs_snapshots",
+  "auth_tokens",
+  "canvas_invites",
 ];
 
 const TASK_META_KEY = "__animeCanvasTaskMeta";
@@ -118,6 +122,8 @@ export function rowToUser(row = {}) {
   return compactObject({
     id: String(row.id),
     name: row.display_name || row.id,
+    email: row.email || undefined,
+    hasPassword: row.password_hash === undefined ? undefined : Boolean(row.password_hash),
     fingerprintHash: row.fingerprint_hash || undefined,
     fingerprintVersion: row.fingerprint_version === undefined ? undefined : toNumber(row.fingerprint_version, 1),
     createdAt: toIso(row.created_at),
@@ -130,6 +136,8 @@ export function userToRow(user = {}, timestamp) {
   return {
     id: String(user.id),
     displayName: String(user.displayName || user.name || user.id),
+    email: user.email ? String(user.email).toLowerCase() : null,
+    passwordHash: user.passwordHash || user.password_hash || null,
     fingerprintHash: user.fingerprintHash || user.fingerprint_hash || null,
     fingerprintVersion: toNumber(user.fingerprintVersion || user.fingerprint_version, 1),
     createdAt: toIso(user.createdAt || user.created_at, timestamp),
@@ -218,13 +226,32 @@ export function canvasMemberToRow(member = {}, timestamp) {
   };
 }
 
+function rewriteSnapshotStorageUrls(snapshot = {}) {
+  const next = cloneJson(snapshot || { nodes: [], edges: [], viewport: { x: 0, y: 0, zoom: 1 } });
+  const rewriteData = (data) => {
+    if (!data || typeof data !== "object" || Array.isArray(data)) return;
+    for (const key of ["url", "resultUrl", "thumbnailUrl"]) {
+      if (typeof data[key] === "string") data[key] = resolveStoredAssetUrl(data[key]);
+    }
+    for (const key of ["inputImages", "images", "referenceImages"]) {
+      if (Array.isArray(data[key])) {
+        data[key] = data[key].map((item) => (typeof item === "string" ? resolveStoredAssetUrl(item) : item));
+      }
+    }
+  };
+  if (Array.isArray(next.nodes)) {
+    for (const node of next.nodes) rewriteData(node?.data);
+  }
+  return next;
+}
+
 export function rowToCanvas(row = {}) {
   return compactObject({
     id: String(row.id),
     projectId: row.project_id,
     ownerId: row.owner_user_id || undefined,
     name: row.name || "Canvas",
-    snapshot: row.snapshot || { nodes: [], edges: [], viewport: { x: 0, y: 0, zoom: 1 } },
+    snapshot: rewriteSnapshotStorageUrls(row.snapshot),
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at),
   });
@@ -245,12 +272,15 @@ export function canvasToRow(canvas = {}, projectOwners = new Map(), timestamp) {
 export function rowToAsset(row = {}) {
   const metadata = asObject(row.metadata);
   const title = row.title && row.title !== row.id ? row.title : undefined;
+  const objectName = metadata.objectName || metadata.object_name;
+  const objectUrl = resolveStoredAssetUrl(row.url, objectName);
   return compactObject({
     ...metadata,
     id: String(row.id),
     projectId: row.project_id,
     type: row.type,
-    url: row.url,
+    url: objectUrl || row.url,
+    thumbnailUrl: objectUrl || metadata.thumbnailUrl,
     name: metadata.name ?? title,
     createdBy: metadata.createdBy || row.owner_user_id || undefined,
     createdAt: toIso(row.created_at),
@@ -277,6 +307,8 @@ export function assetToRow(asset = {}, projectOwners = new Map(), timestamp) {
 export function rowToTask(row = {}) {
   const input = cloneJson(row.input || {});
   const meta = asObject(input[TASK_META_KEY]);
+  const output = row.output ? cloneJson(row.output) : undefined;
+  if (output?.objectName || output?.url) output.url = resolveStoredAssetUrl(output.url, output.objectName);
   delete input[TASK_META_KEY];
   return compactObject({
     ...meta,
@@ -290,7 +322,7 @@ export function rowToTask(row = {}) {
     status: row.status,
     progress: toNumber(row.progress, 0),
     input,
-    output: row.output || undefined,
+    output,
     error: row.error || undefined,
     createdBy: meta.createdBy || row.user_id || undefined,
     createdAt: toIso(row.created_at),
@@ -501,6 +533,225 @@ async function getCanvasYjsPersistenceRows(client, canvasId) {
   return { snapshot, updates };
 }
 
+function rowToAuthUser(row = {}) {
+  return compactObject({
+    ...rowToUser(row),
+    passwordHash: row.password_hash || undefined,
+  });
+}
+
+export async function getAuthUserByLogin(login) {
+  const normalized = String(login || "").trim().toLowerCase();
+  if (!normalized) return null;
+  const nextPool = await loadPgPool();
+  const client = await nextPool.connect();
+  try {
+    const result = await client.query(
+      `select id, display_name, email, password_hash, fingerprint_hash, fingerprint_version, created_at, updated_at, last_seen_at
+       from users
+       where lower(coalesce(email, '')) = $1 or id = $2
+       limit 1`,
+      [normalized, String(login || "").trim()],
+    );
+    if (result.rowCount === 0) return null;
+    return rowToAuthUser(result.rows[0]);
+  } finally {
+    client.release();
+  }
+}
+
+export async function getAuthUserByTokenHash(tokenHash) {
+  const nextPool = await loadPgPool();
+  const client = await nextPool.connect();
+  try {
+    const result = await client.query(
+      `select u.id, u.display_name, u.email, u.fingerprint_hash, u.fingerprint_version, u.created_at, u.updated_at, u.last_seen_at
+       from auth_tokens t
+       join users u on u.id = t.user_id
+       where t.token_hash = $1 and t.expires_at > now()
+       limit 1`,
+      [tokenHash],
+    );
+    if (result.rowCount === 0) return null;
+    await client.query("update auth_tokens set last_used_at = now() where token_hash = $1", [tokenHash]);
+    return rowToUser(result.rows[0]);
+  } finally {
+    client.release();
+  }
+}
+
+export async function createAuthTokenRecord(tokenHash, userId, expiresAt, createdAt) {
+  const nextPool = await loadPgPool();
+  const client = await nextPool.connect();
+  try {
+    await client.query(
+      "insert into auth_tokens (token_hash, user_id, created_at, expires_at, last_used_at) values ($1, $2, $3, $4, $3)",
+      [tokenHash, userId, createdAt, expiresAt],
+    );
+  } finally {
+    client.release();
+  }
+}
+
+export async function revokeAuthTokenRecord(tokenHash) {
+  const nextPool = await loadPgPool();
+  const client = await nextPool.connect();
+  try {
+    await client.query("delete from auth_tokens where token_hash = $1", [tokenHash]);
+  } finally {
+    client.release();
+  }
+}
+
+export async function getCanvasAccessView(canvasId, userId) {
+  const nextPool = await loadPgPool();
+  const client = await nextPool.connect();
+  try {
+    const result = await client.query(
+      `select c.id, c.project_id, c.owner_user_id, c.created_at,
+        case
+          when c.owner_user_id = $2 then 'owner'
+          when cm.role is not null then cm.role
+          else null
+        end as role
+       from canvases c
+       left join canvas_members cm on cm.canvas_id = c.id and cm.user_id = $2
+       where c.id = $1
+       limit 1`,
+      [canvasId, userId || ""],
+    );
+    if (result.rowCount === 0) return null;
+    const row = result.rows[0];
+    if (!row.role) return { exists: true, allowed: false };
+    return {
+      exists: true,
+      allowed: true,
+      role: row.role,
+      canvasId: row.id,
+      projectId: row.project_id,
+      ownerId: row.owner_user_id,
+    };
+  } finally {
+    client.release();
+  }
+}
+
+export async function getProjectAccessView(projectId, userId) {
+  const nextPool = await loadPgPool();
+  const client = await nextPool.connect();
+  try {
+    const result = await client.query(
+      `select p.id,
+        case
+          when p.owner_user_id = $2 then 'owner'
+          when pm.role is not null then pm.role
+          else null
+        end as role
+       from projects p
+       left join project_members pm on pm.project_id = p.id and pm.user_id = $2
+       where p.id = $1
+       limit 1`,
+      [projectId, userId || ""],
+    );
+    if (result.rowCount === 0) return null;
+    const role = result.rows[0].role;
+    return { exists: true, allowed: Boolean(role), role };
+  } finally {
+    client.release();
+  }
+}
+
+export async function createCanvasInviteRecord(invite) {
+  const nextPool = await loadPgPool();
+  const client = await nextPool.connect();
+  try {
+    const result = await client.query(
+      `insert into canvas_invites (id, canvas_id, owner_user_id, code, role, max_uses, used_count, expires_at, created_at)
+       values ($1, $2, $3, $4, $5, $6, 0, $7, $8)
+       returning id, canvas_id, owner_user_id, code, role, max_uses, used_count, expires_at, revoked_at, created_at`,
+      [invite.id, invite.canvasId, invite.ownerId, invite.code, invite.role, invite.maxUses ?? null, invite.expiresAt || null, invite.createdAt],
+    );
+    return rowToCanvasInvite(result.rows[0]);
+  } finally {
+    client.release();
+  }
+}
+
+export function rowToCanvasInvite(row = {}) {
+  return compactObject({
+    id: String(row.id),
+    canvasId: row.canvas_id,
+    ownerId: row.owner_user_id,
+    code: row.code,
+    role: row.role || "editor",
+    maxUses: row.max_uses === null || row.max_uses === undefined ? undefined : toNumber(row.max_uses),
+    usedCount: toNumber(row.used_count, 0),
+    expiresAt: row.expires_at ? toIso(row.expires_at) : undefined,
+    revokedAt: row.revoked_at ? toIso(row.revoked_at) : undefined,
+    createdAt: toIso(row.created_at),
+  });
+}
+
+export async function acceptCanvasInviteRecord(code, userId, acceptedAt) {
+  const nextPool = await loadPgPool();
+  const client = await nextPool.connect();
+  try {
+    await client.query("begin");
+    try {
+      const inviteResult = await client.query(
+        `select id, canvas_id, owner_user_id, code, role, max_uses, used_count, expires_at, revoked_at, created_at
+         from canvas_invites
+         where code = $1
+         for update`,
+        [code],
+      );
+      if (inviteResult.rowCount === 0) {
+        await client.query("rollback");
+        return null;
+      }
+      const invite = rowToCanvasInvite(inviteResult.rows[0]);
+      const access = await client.query("select owner_user_id from canvases where id = $1", [invite.canvasId]);
+      if (access.rowCount === 0) {
+        await client.query("rollback");
+        return { invite, error: "canvas_not_found" };
+      }
+      if (access.rows[0].owner_user_id === userId) {
+        await client.query("commit");
+        return { invite, member: { canvasId: invite.canvasId, userId, role: "owner", addedAt: acceptedAt } };
+      }
+      const existingMember = await client.query(
+        "select canvas_id, user_id, role, added_at from canvas_members where canvas_id = $1 and user_id = $2",
+        [invite.canvasId, userId],
+      );
+      if (existingMember.rowCount > 0) {
+        await client.query("commit");
+        return { invite, member: rowToCanvasMember(existingMember.rows[0]) };
+      }
+      const expired = invite.expiresAt && new Date(invite.expiresAt).getTime() <= Date.now();
+      const overUsed = invite.maxUses !== undefined && invite.usedCount >= invite.maxUses;
+      if (invite.revokedAt || expired || overUsed) {
+        await client.query("rollback");
+        return { invite, error: expired ? "expired" : overUsed ? "used_up" : "revoked" };
+      }
+      const memberResult = await client.query(
+        `insert into canvas_members (canvas_id, user_id, role, added_at)
+         values ($1, $2, $3, $4)
+         on conflict (canvas_id, user_id) do update set role = excluded.role, added_at = excluded.added_at
+         returning canvas_id, user_id, role, added_at`,
+        [invite.canvasId, userId, invite.role, acceptedAt],
+      );
+      await client.query("update canvas_invites set used_count = used_count + 1 where id = $1", [invite.id]);
+      await client.query("commit");
+      return { invite, member: rowToCanvasMember(memberResult.rows[0]) };
+    } catch (error) {
+      await client.query("rollback").catch(() => {});
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
+
 export function preparePostgresSnapshot(db = {}, options = {}) {
   const timestamp = options.timestamp || new Date().toISOString();
   const next = {
@@ -555,6 +806,21 @@ export function preparePostgresSnapshot(db = {}, options = {}) {
   return next;
 }
 
+export function preserveExistingUserAuthFields(users = [], existingUsers = []) {
+  const existingById = new Map(asArray(existingUsers).filter((user) => user?.id).map((user) => [String(user.id), user]));
+  return asArray(users).map((user) => {
+    const existing = existingById.get(String(user?.id || ""));
+    if (!existing) return user;
+    return {
+      ...user,
+      email: user.email || user.email_address || existing.email || existing.email_address,
+      passwordHash: user.passwordHash || user.password_hash || existing.passwordHash || existing.password_hash,
+      fingerprintHash: user.fingerprintHash || user.fingerprint_hash || existing.fingerprintHash || existing.fingerprint_hash,
+      fingerprintVersion: user.fingerprintVersion || user.fingerprint_version || existing.fingerprintVersion || existing.fingerprint_version,
+    };
+  });
+}
+
 async function loadPgPool() {
   if (pool) return pool;
   if (!process.env.DATABASE_URL) {
@@ -569,11 +835,22 @@ async function loadPgPool() {
   const ssl = process.env.DATABASE_SSL === "true"
     ? { rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== "false" }
     : undefined;
+  // 生产环境调优：
+  // - max 连接数提升以支持并发（默认 10，生产建议 20-30）
+  // - statement_timeout 防止慢查询阻塞连接池
+  // - idle_in_transaction_session_timeout 防止事务泄漏耗尽连接
+  // - query_timeout 应用层超时，避免请求无限等待
+  // options 通过启动包设置会话参数，避免 connect 事件的竞态问题
+  const statementTimeoutMs = Number(process.env.POSTGRES_STATEMENT_TIMEOUT_MS || 15000);
+  const idleInTransactionTimeoutMs = Number(process.env.POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS || 10000);
+  const queryTimeoutMs = Number(process.env.POSTGRES_QUERY_TIMEOUT_MS || 30000);
   pool = new pg.Pool({
     connectionString: process.env.DATABASE_URL,
     max: Number(process.env.POSTGRES_POOL_MAX || 10),
     connectionTimeoutMillis: Number(process.env.POSTGRES_CONNECT_TIMEOUT_MS || 5000),
     idleTimeoutMillis: Number(process.env.POSTGRES_IDLE_TIMEOUT_MS || 30000),
+    query_timeout: queryTimeoutMs,
+    options: `-c statement_timeout=${statementTimeoutMs} -c idle_in_transaction_session_timeout=${idleInTransactionTimeoutMs}`,
     ssl,
   });
   pool.on("error", (error) => {
@@ -596,6 +873,21 @@ export async function assertRequiredTables(client) {
     await client.query("create index if not exists canvas_members_user_id_idx on canvas_members(user_id)");
     found.add("canvas_members");
   }
+  await client.query("alter table users add column if not exists email text");
+  await client.query("alter table users add column if not exists password_hash text");
+  await client.query("create unique index if not exists users_email_lower_unique_idx on users(lower(email)) where email is not null and email <> ''");
+  if (!found.has("auth_tokens")) {
+    await client.query(
+      "create table if not exists auth_tokens (token_hash text primary key, user_id text not null references users(id) on delete cascade, created_at timestamptz not null, expires_at timestamptz not null, last_used_at timestamptz)",
+    );
+    found.add("auth_tokens");
+  }
+  if (!found.has("canvas_invites")) {
+    await client.query(
+      "create table if not exists canvas_invites (id text primary key, canvas_id text not null references canvases(id) on delete cascade, owner_user_id text not null references users(id) on delete cascade, code text not null unique, role text not null check (role in ('editor', 'viewer')), max_uses integer, used_count integer not null default 0, expires_at timestamptz, revoked_at timestamptz, created_at timestamptz not null)",
+    );
+    found.add("canvas_invites");
+  }
   const missing = REQUIRED_TABLES.filter((table) => !found.has(table));
   if (missing.length) {
     throw new Error(`PostgreSQL schema is missing required tables: ${missing.join(", ")}`);
@@ -606,6 +898,10 @@ export async function assertRequiredTables(client) {
   await client.query("create index if not exists assets_project_created_idx on assets(project_id, created_at desc)");
   await client.query("create index if not exists tasks_canvas_updated_idx on tasks(canvas_id, updated_at desc)");
   await client.query("create index if not exists system_events_created_idx on system_events(created_at desc)");
+  await client.query("create index if not exists project_members_user_project_idx on project_members(user_id, project_id)");
+  await client.query("create index if not exists canvas_members_user_canvas_idx on canvas_members(user_id, canvas_id)");
+  await client.query("create index if not exists auth_tokens_user_expires_idx on auth_tokens(user_id, expires_at)");
+  await client.query("create index if not exists canvas_invites_canvas_idx on canvas_invites(canvas_id, created_at desc)");
 }
 
 export async function lockSnapshotWrite(client) {
@@ -708,6 +1004,16 @@ async function clearTables(client) {
 export async function replacePostgresSnapshot(client, db = {}) {
   const timestamp = new Date().toISOString();
   const snapshot = preparePostgresSnapshot(db, { timestamp });
+  const existingUsersResult = await client.query(
+    "select id, email, password_hash, fingerprint_hash, fingerprint_version from users",
+  ).catch(() => ({ rows: [] }));
+  snapshot.users = preserveExistingUserAuthFields(snapshot.users, existingUsersResult.rows.map((row) => ({
+    id: row.id,
+    email: row.email,
+    passwordHash: row.password_hash,
+    fingerprintHash: row.fingerprint_hash,
+    fingerprintVersion: row.fingerprint_version,
+  })));
   const projectOwners = projectOwnerMap(snapshot.projects);
   const userIds = new Set(snapshot.users.map((user) => user.id));
   const projectIds = new Set(snapshot.projects.map((project) => project.id));
@@ -721,8 +1027,8 @@ export async function replacePostgresSnapshot(client, db = {}) {
     if (!user?.id) continue;
     const row = userToRow(user, timestamp);
     await client.query(
-      "insert into users (id, display_name, fingerprint_hash, fingerprint_version, created_at, updated_at, last_seen_at) values ($1, $2, $3, $4, $5, $6, $7)",
-      [row.id, row.displayName, row.fingerprintHash, row.fingerprintVersion, row.createdAt, row.updatedAt, row.lastSeenAt],
+      "insert into users (id, display_name, email, password_hash, fingerprint_hash, fingerprint_version, created_at, updated_at, last_seen_at) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+      [row.id, row.displayName, row.email, row.passwordHash, row.fingerprintHash, row.fingerprintVersion, row.createdAt, row.updatedAt, row.lastSeenAt],
     );
   }
 
@@ -929,6 +1235,47 @@ export async function getProjectView(projectId, userId) {
   }
 }
 
+export async function listCollaborativeCanvasesView(userId) {
+  const nextPool = await loadPgPool();
+  const client = await nextPool.connect();
+  try {
+    const result = await client.query(`
+      select
+        c.id,
+        c.project_id,
+        c.owner_user_id,
+        c.name,
+        c.snapshot,
+        c.created_at,
+        c.updated_at,
+        cm.role,
+        cm.added_at,
+        p.name as project_name,
+        u.display_name as owner_name,
+        u.email as owner_email
+      from canvas_members cm
+      join canvases c on c.id = cm.canvas_id
+      left join projects p on p.id = c.project_id
+      left join users u on u.id = c.owner_user_id
+      where cm.user_id = $1 and c.owner_user_id <> $1
+      order by c.updated_at desc
+    `, [userId || ""]);
+    return result.rows.map((row) => compactObject({
+      canvas: rowToCanvas(row),
+      role: row.role || "viewer",
+      addedAt: row.added_at ? toIso(row.added_at) : undefined,
+      projectName: row.project_name || undefined,
+      owner: compactObject({
+        id: row.owner_user_id,
+        name: row.owner_name || row.owner_user_id,
+        email: row.owner_email || undefined,
+      }),
+    }));
+  } finally {
+    client.release();
+  }
+}
+
 export async function getCanvasView(canvasId) {
   const nextPool = await loadPgPool();
   const client = await nextPool.connect();
@@ -957,10 +1304,18 @@ export async function listCanvasMembersView(canvasId) {
     const canvas = canvasResult.rows[0];
 
     const membersResult = await client.query(
-      "select canvas_id, user_id, role, added_at from canvas_members where canvas_id = $1",
+      `select cm.canvas_id, cm.user_id, cm.role, cm.added_at, u.display_name, u.email
+       from canvas_members cm
+       left join users u on u.id = cm.user_id
+       where cm.canvas_id = $1
+       order by cm.added_at asc`,
       [canvasId],
     );
-    const members = membersResult.rows.map(rowToCanvasMember);
+    const members = membersResult.rows.map((row) => compactObject({
+      ...rowToCanvasMember(row),
+      userName: row.display_name || row.user_id,
+      userEmail: row.email || undefined,
+    }));
     const ownerEntry = {
       canvasId: canvas.id,
       userId: canvas.owner_user_id || "default-user",
@@ -990,6 +1345,144 @@ export async function listAssetsView(projectId) {
       "select id, project_id, owner_user_id, type, title, url, metadata, created_at, updated_at from assets order by created_at desc",
     );
     return result.rows.map(rowToAsset);
+  } finally {
+    client.release();
+  }
+}
+
+export async function listAdminUsersView() {
+  const nextPool = await loadPgPool();
+  const client = await nextPool.connect();
+  try {
+    const result = await client.query(`
+      select
+        u.id,
+        u.display_name,
+        u.email,
+        u.password_hash,
+        u.created_at,
+        u.updated_at,
+        u.last_seen_at,
+        count(distinct p.id) as project_count,
+        count(distinct c.id) as owned_canvas_count,
+        count(distinct cm.canvas_id) as shared_canvas_count
+      from users u
+      left join projects p on p.owner_user_id = u.id
+      left join canvases c on c.owner_user_id = u.id
+      left join canvas_members cm on cm.user_id = u.id
+      group by u.id, u.display_name, u.email, u.password_hash, u.created_at, u.updated_at, u.last_seen_at
+      order by u.created_at desc
+    `);
+    return result.rows.map((row) => compactObject({
+      ...rowToUser(row),
+      projectCount: toNumber(row.project_count, 0),
+      ownedCanvasCount: toNumber(row.owned_canvas_count, 0),
+      sharedCanvasCount: toNumber(row.shared_canvas_count, 0),
+    }));
+  } finally {
+    client.release();
+  }
+}
+
+export async function listProvidersView() {
+  const nextPool = await loadPgPool();
+  const client = await nextPool.connect();
+  try {
+    const result = await client.query("select * from providers order by created_at asc, id asc");
+    return result.rows.map(rowToProvider);
+  } finally {
+    client.release();
+  }
+}
+
+export async function listModelsView() {
+  const nextPool = await loadPgPool();
+  const client = await nextPool.connect();
+  try {
+    const result = await client.query("select * from models order by created_at asc, id asc");
+    return result.rows.map(rowToModel);
+  } finally {
+    client.release();
+  }
+}
+
+export async function updateAdminUserRecord(userId, patch = {}) {
+  const nextPool = await loadPgPool();
+  const client = await nextPool.connect();
+  try {
+    const sets = [];
+    const values = [];
+    const set = (column, value) => {
+      values.push(value);
+      sets.push(`${column} = $${values.length}`);
+    };
+    if ("name" in patch || "displayName" in patch) set("display_name", String(patch.displayName || patch.name || "").trim());
+    if ("email" in patch) {
+      const email = String(patch.email || "").trim().toLowerCase();
+      set("email", email || null);
+    }
+    if ("passwordHash" in patch || "password_hash" in patch) {
+      set("password_hash", patch.passwordHash || patch.password_hash || null);
+    }
+    set("updated_at", new Date().toISOString());
+      values.push(userId);
+      const result = await client.query(
+        `update users set ${sets.join(", ")} where id = $${values.length}
+       returning id, display_name, email, password_hash, fingerprint_hash, fingerprint_version, created_at, updated_at, last_seen_at`,
+      values,
+    );
+    if (result.rowCount === 0) return null;
+    return rowToUser(result.rows[0]);
+  } finally {
+    client.release();
+  }
+}
+
+export async function deleteAdminUserRecord(userId) {
+  const nextPool = await loadPgPool();
+  const client = await nextPool.connect();
+  try {
+    await client.query("begin");
+    try {
+      const userResult = await client.query(
+        "select id, display_name, email, fingerprint_hash, fingerprint_version, created_at, updated_at, last_seen_at from users where id = $1 for update",
+        [userId],
+      );
+      if (userResult.rowCount === 0) {
+        await client.query("rollback");
+        return null;
+      }
+      const countsResult = await client.query(
+        `select
+          (select count(*) from projects where owner_user_id = $1) as project_count,
+          (select count(*) from canvases where owner_user_id = $1) as owned_canvas_count`,
+        [userId],
+      );
+      const projectCount = toNumber(countsResult.rows[0]?.project_count, 0);
+      const ownedCanvasCount = toNumber(countsResult.rows[0]?.owned_canvas_count, 0);
+      if (projectCount > 0 || ownedCanvasCount > 0) {
+        await client.query("rollback");
+        return {
+          error: "user_owns_content",
+          user: rowToUser(userResult.rows[0]),
+          projectCount,
+          ownedCanvasCount,
+        };
+      }
+      await client.query("delete from auth_tokens where user_id = $1", [userId]);
+      await client.query("delete from canvas_invites where owner_user_id = $1", [userId]);
+      await client.query("delete from canvas_members where user_id = $1", [userId]);
+      await client.query("delete from project_members where user_id = $1", [userId]);
+      const deletedResult = await client.query(
+        "delete from users where id = $1 returning id, display_name, email, fingerprint_hash, fingerprint_version, created_at, updated_at, last_seen_at",
+        [userId],
+      );
+      await client.query("commit");
+      return { deleted: true, user: rowToUser(deletedResult.rows[0]) };
+    } catch (error) {
+      await client.query("rollback").catch(() => {});
+      throw error;
+    }
   } finally {
     client.release();
   }
@@ -1383,12 +1876,15 @@ export function createPostgresStore({ createDefaultDb, normalizeDb }) {
     },
     // 直接更新单个 canvas 的 snapshot，避免全表重写导致的性能问题。
     // 返回更新后的 canvas 对象，找不到时返回 null。
-    async updateCanvasSnapshot(canvasId, snapshot, updatedAt) {
+    async updateCanvasSnapshot(canvasId, snapshot, updatedAt, options = {}) {
       return withClient(async (client) => {
         await client.query("begin");
         try {
+          const returning = options.returnSnapshot === false
+            ? "id, project_id, owner_user_id, name, created_at, updated_at"
+            : "id, project_id, owner_user_id, name, snapshot, created_at, updated_at";
           const result = await client.query(
-            "update canvases set snapshot = $1::jsonb, updated_at = $2 where id = $3 returning id, project_id, owner_user_id, name, snapshot, created_at, updated_at",
+            `update canvases set snapshot = $1::jsonb, updated_at = $2 where id = $3 returning ${returning}`,
             [JSON.stringify(snapshot || {}), updatedAt, canvasId],
           );
           if (result.rowCount === 0) {
@@ -1470,8 +1966,8 @@ export function createPostgresStore({ createDefaultDb, normalizeDb }) {
         try {
           const row = userToRow(user, user.createdAt);
           await client.query(
-            "insert into users (id, display_name, fingerprint_hash, fingerprint_version, created_at, updated_at, last_seen_at) values ($1, $2, $3, $4, $5, $6, $7)",
-            [row.id, row.displayName, row.fingerprintHash, row.fingerprintVersion, row.createdAt, row.updatedAt, row.lastSeenAt],
+            "insert into users (id, display_name, email, password_hash, fingerprint_hash, fingerprint_version, created_at, updated_at, last_seen_at) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            [row.id, row.displayName, row.email, user.passwordHash || user.password_hash || null, row.fingerprintHash, row.fingerprintVersion, row.createdAt, row.updatedAt, row.lastSeenAt],
           );
           await client.query("commit");
           return user;
@@ -1499,6 +1995,28 @@ export function createPostgresStore({ createDefaultDb, normalizeDb }) {
         }
       });
     },
+    async createProjectWithCanvas(project, canvas) {
+      return withClient(async (client) => {
+        await client.query("begin");
+        try {
+          const projectRow = projectToRow(project, project.createdAt);
+          const canvasRow = canvasToRow({ ...canvas, projectId: project.id, ownerId: project.ownerId }, new Map(), canvas.createdAt);
+          await client.query(
+            "insert into projects (id, owner_user_id, name, created_at, updated_at) values ($1, $2, $3, $4, $5)",
+            [projectRow.id, projectRow.ownerUserId, projectRow.name, projectRow.createdAt, projectRow.updatedAt],
+          );
+          await client.query(
+            "insert into canvases (id, project_id, owner_user_id, name, snapshot, created_at, updated_at) values ($1, $2, $3, $4, $5::jsonb, $6, $7)",
+            [canvasRow.id, canvasRow.projectId, canvasRow.ownerUserId, canvasRow.name, JSON.stringify(canvasRow.snapshot), canvasRow.createdAt, canvasRow.updatedAt],
+          );
+          await client.query("commit");
+          return { project, canvas: { ...canvas, projectId: project.id, ownerId: project.ownerId } };
+        } catch (error) {
+          await client.query("rollback").catch(() => {});
+          throw error;
+        }
+      });
+    },
     // 直接插入 canvas，避免全表重写。
     async createCanvas(canvas) {
       return withClient(async (client) => {
@@ -1509,6 +2027,7 @@ export function createPostgresStore({ createDefaultDb, normalizeDb }) {
             "insert into canvases (id, project_id, owner_user_id, name, snapshot, created_at, updated_at) values ($1, $2, $3, $4, $5::jsonb, $6, $7)",
             [row.id, row.projectId, row.ownerUserId, row.name, JSON.stringify(row.snapshot), row.createdAt, row.updatedAt],
           );
+          await client.query("update projects set updated_at = $1 where id = $2", [row.updatedAt, row.projectId]);
           await client.query("commit");
           return canvas;
         } catch (error) {
@@ -1540,7 +2059,7 @@ export function createPostgresStore({ createDefaultDb, normalizeDb }) {
       return withClient(async (client) => {
         await client.query("begin");
         try {
-          const selectResult = await client.query("select input, output from tasks where id = $1 for update", [taskId]);
+          const selectResult = await client.query("select status, progress, input, output from tasks where id = $1 for update", [taskId]);
           if (selectResult.rowCount === 0) {
             await client.query("rollback");
             return null;
@@ -1551,12 +2070,14 @@ export function createPostgresStore({ createDefaultDb, normalizeDb }) {
           if (patch.input) Object.assign(merged, patch.input);
           const output = patch.output || existingOutput;
           const updatedAt = new Date().toISOString();
+          const status = patch.status || selectResult.rows[0].status || "pending";
+          const progress = patch.progress ?? toNumber(selectResult.rows[0].progress, 0);
           await client.query(
             "update tasks set status = $1, progress = $2, input = $3::jsonb, output = $4::jsonb, error = $5, updated_at = $6 where id = $7",
-            [patch.status || "pending", patch.progress || 0, JSON.stringify(merged), output ? JSON.stringify(output) : null, patch.error || null, updatedAt, taskId],
+            [status, progress, JSON.stringify(merged), output ? JSON.stringify(output) : null, patch.error || null, updatedAt, taskId],
           );
           await client.query("commit");
-          return { id: taskId, ...patch, input: merged, output, updatedAt };
+          return { id: taskId, ...patch, status, progress, input: merged, output, updatedAt };
         } catch (error) {
           await client.query("rollback").catch(() => {});
           throw error;
@@ -1599,6 +2120,237 @@ export function createPostgresStore({ createDefaultDb, normalizeDb }) {
         }
       });
     },
+    // 直接更新单个 project，避免 updateJson 的全表重写。
+    async updateProject(projectId, patch) {
+      return withClient(async (client) => {
+        await client.query("begin");
+        try {
+          const sets = [];
+          const values = [];
+          const set = (column, value) => {
+            values.push(value);
+            sets.push(`${column} = $${values.length}`);
+          };
+          if ("name" in patch) set("name", String(patch.name || ""));
+          set("updated_at", new Date().toISOString());
+          if (!sets.length) {
+            await client.query("rollback");
+            return null;
+          }
+          values.push(projectId);
+          const result = await client.query(
+            `update projects set ${sets.join(", ")} where id = $${values.length} returning id, owner_user_id, name, created_at, updated_at`,
+            values,
+          );
+          if (result.rowCount === 0) {
+            await client.query("rollback");
+            return null;
+          }
+          await client.query("commit");
+          return rowToProject(result.rows[0]);
+        } catch (error) {
+          await client.query("rollback").catch(() => {});
+          throw error;
+        }
+      });
+    },
+    // 直接更新 canvas 元数据（名称等），避免全表重写。
+    async updateCanvasMeta(canvasId, patch) {
+      return withClient(async (client) => {
+        await client.query("begin");
+        try {
+          const sets = [];
+          const values = [];
+          const set = (column, value) => {
+            values.push(value);
+            sets.push(`${column} = $${values.length}`);
+          };
+          if ("name" in patch) set("name", String(patch.name || ""));
+          set("updated_at", new Date().toISOString());
+          if (!sets.length) {
+            await client.query("rollback");
+            return null;
+          }
+          values.push(canvasId);
+          const result = await client.query(
+            `update canvases set ${sets.join(", ")} where id = $${values.length} returning id, project_id, owner_user_id, name, snapshot, created_at, updated_at`,
+            values,
+          );
+          if (result.rowCount === 0) {
+            await client.query("rollback");
+            return null;
+          }
+          await client.query("commit");
+          return rowToCanvas(result.rows[0]);
+        } catch (error) {
+          await client.query("rollback").catch(() => {});
+          throw error;
+        }
+      });
+    },
+    // 直接 upsert canvas 成员，避免全表重写。
+    async upsertCanvasMember(canvasId, userId, role, addedAt) {
+      return withClient(async (client) => {
+        await client.query("begin");
+        try {
+          const result = await client.query(
+            `insert into canvas_members (canvas_id, user_id, role, added_at)
+             values ($1, $2, $3, $4)
+             on conflict (canvas_id, user_id) do update set role = excluded.role, added_at = excluded.added_at
+             returning canvas_id, user_id, role, added_at`,
+            [canvasId, userId, role, addedAt],
+          );
+          await client.query("commit");
+          return { canvasId, userId, role, addedAt: result.rows[0].added_at };
+        } catch (error) {
+          await client.query("rollback").catch(() => {});
+          throw error;
+        }
+      });
+    },
+    // 直接删除 canvas 成员，避免全表重写。
+    async removeCanvasMember(canvasId, userId) {
+      return withClient(async (client) => {
+        await client.query("begin");
+        try {
+          const result = await client.query(
+            "delete from canvas_members where canvas_id = $1 and user_id = $2 returning user_id",
+            [canvasId, userId],
+          );
+          if (result.rowCount === 0) {
+            await client.query("rollback");
+            return null;
+          }
+          await client.query("commit");
+          return { canvasId, userId };
+        } catch (error) {
+          await client.query("rollback").catch(() => {});
+          throw error;
+        }
+      });
+    },
+    // 直接更新 asset，避免全表重写。
+    async updateAsset(assetId, patch) {
+      return withClient(async (client) => {
+        await client.query("begin");
+        try {
+          const sets = [];
+          const values = [];
+          const set = (column, value) => {
+            values.push(value);
+            sets.push(`${column} = $${values.length}`);
+          };
+          if ("name" in patch) set("title", String(patch.name || ""));
+          if ("metadata" in patch) set("metadata", JSON.stringify(patch.metadata));
+          if (!sets.length) {
+            await client.query("rollback");
+            return null;
+          }
+          values.push(assetId);
+          const result = await client.query(
+            `update assets set ${sets.join(", ")} where id = $${values.length} returning id, project_id, owner_user_id, type, title, url, metadata, created_at, updated_at`,
+            values,
+          );
+          if (result.rowCount === 0) {
+            await client.query("rollback");
+            return null;
+          }
+          await client.query("commit");
+          return rowToAsset(result.rows[0]);
+        } catch (error) {
+          await client.query("rollback").catch(() => {});
+          throw error;
+        }
+      });
+    },
+    // 直接删除 asset，避免全表重写。
+    async deleteAsset(assetId) {
+      return withClient(async (client) => {
+        await client.query("begin");
+        try {
+          const result = await client.query(
+            "delete from assets where id = $1 returning id, project_id, owner_user_id, type, title, url, metadata, created_at, updated_at",
+            [assetId],
+          );
+          if (result.rowCount === 0) {
+            await client.query("rollback");
+            return null;
+          }
+          await client.query("commit");
+          return rowToAsset(result.rows[0]);
+        } catch (error) {
+          await client.query("rollback").catch(() => {});
+          throw error;
+        }
+      });
+    },
+    // 直接创建 provider，避免全表重写。
+    async createProvider(provider) {
+      return withClient(async (client) => {
+        await client.query("begin");
+        try {
+          await client.query(
+            "insert into providers (id, owner_user_id, type, name, base_url, auth_type, api_key, default_headers, metadata, secret_storage, timeout_seconds, enabled, created_at, updated_at) values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14)",
+            [
+              provider.id,
+              provider.ownerUserId,
+              provider.type,
+              provider.name,
+              provider.baseUrl,
+              provider.authType,
+              provider.apiKey,
+              JSON.stringify(provider.defaultHeaders || {}),
+              JSON.stringify(provider.metadata || {}),
+              provider.secretStorage || null,
+              provider.timeoutSeconds || 30,
+              provider.enabled !== false,
+              provider.createdAt,
+              provider.updatedAt,
+            ],
+          );
+          await client.query("commit");
+          return provider;
+        } catch (error) {
+          await client.query("rollback").catch(() => {});
+          throw error;
+        }
+      });
+    },
+    // 直接创建 model，避免全表重写。
+    async createModel(model) {
+      return withClient(async (client) => {
+        await client.query("begin");
+        try {
+          await client.query(
+            "insert into models (id, provider_id, owner_user_id, name, display_name, type, capabilities, default_params, default_public_params, param_schema, public_param_schema, adapter, enabled, sort_order, allow_mock_fallback, created_at, updated_at) values ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12, $13, $14, $15, $16, $17)",
+            [
+              model.id,
+              model.providerId,
+              model.ownerUserId,
+              model.name,
+              model.displayName,
+              model.type,
+              JSON.stringify(model.capabilities || []),
+              JSON.stringify(model.defaultParams || {}),
+              JSON.stringify(model.defaultPublicParams || {}),
+              JSON.stringify(model.paramSchema || {}),
+              JSON.stringify(model.publicParamSchema || {}),
+              model.adapter || null,
+              model.enabled !== false,
+              model.sortOrder || 0,
+              model.allowMockFallback !== false,
+              model.createdAt,
+              model.updatedAt,
+            ],
+          );
+          await client.query("commit");
+          return model;
+        } catch (error) {
+          await client.query("rollback").catch(() => {});
+          throw error;
+        }
+      });
+    },
     // 直接删除 canvas，避免全表重写。
     async persistYjsUpdate(canvasId, encodedUpdate, options = {}) {
       return withClient(async (client) => {
@@ -1628,6 +2380,7 @@ export function createPostgresStore({ createDefaultDb, normalizeDb }) {
             update: record,
             snapshot: null,
             pendingUpdateCount: persistence.updates.length + 1,
+            snapshotCreatedAt: persistence.snapshot?.createdAt || null,
           };
         } catch (error) {
           await client.query("rollback").catch(() => {});
@@ -1668,17 +2421,92 @@ export function createPostgresStore({ createDefaultDb, normalizeDb }) {
         }
       });
     },
+    // 直接查询单个 canvas 的 Yjs 持久化数据（快照 + 增量更新），
+    // 避免 getRoomYDoc 触发 readJson() 加载整个数据库快照。
+    async getCanvasYjsPersistence(canvasId) {
+      return withClient(async (client) => {
+        return getCanvasYjsPersistenceRows(client, canvasId);
+      });
+    },
     async deleteCanvas(canvasId) {
       return withClient(async (client) => {
         await client.query("begin");
         try {
+          const existing = await client.query("select project_id from canvases where id = $1", [canvasId]);
           const result = await client.query("delete from canvases where id = $1 returning id, project_id, owner_user_id, name, snapshot, created_at, updated_at", [canvasId]);
           if (result.rowCount === 0) {
             await client.query("rollback");
             return null;
           }
+          if (existing.rowCount > 0) {
+            await client.query("update projects set updated_at = now() where id = $1", [existing.rows[0].project_id]);
+          }
           await client.query("commit");
           return rowToCanvas(result.rows[0]);
+        } catch (error) {
+          await client.query("rollback").catch(() => {});
+          throw error;
+        }
+      });
+    },
+    async deleteProjectGraph(projectId, userId) {
+      return withClient(async (client) => {
+        await client.query("begin");
+        try {
+          const projectResult = await client.query(
+            "select id, name, owner_user_id, created_at, updated_at from projects where id = $1 for update",
+            [projectId],
+          );
+          if (projectResult.rowCount === 0) {
+            await client.query("rollback");
+            return null;
+          }
+          const canvasResult = await client.query(
+            "select id, project_id, owner_user_id, name, snapshot, created_at, updated_at from canvases where project_id = $1 order by created_at asc",
+            [projectId],
+          );
+          const assetResult = await client.query(
+            "select id, project_id, owner_user_id, type, title, url, metadata, created_at, updated_at from assets where project_id = $1 order by created_at asc",
+            [projectId],
+          );
+          const canvasIds = canvasResult.rows.map((row) => row.id);
+          if (canvasIds.length > 0) {
+            await client.query("delete from yjs_updates where canvas_id = any($1::text[])", [canvasIds]);
+            await client.query("delete from yjs_snapshots where canvas_id = any($1::text[])", [canvasIds]);
+            await client.query("delete from canvas_invites where canvas_id = any($1::text[])", [canvasIds]);
+            await client.query("delete from canvas_members where canvas_id = any($1::text[])", [canvasIds]);
+            await client.query("delete from tasks where canvas_id = any($1::text[])", [canvasIds]);
+          }
+          await client.query("delete from assets where project_id = $1", [projectId]);
+          await client.query("delete from canvases where project_id = $1", [projectId]);
+          await client.query("delete from project_members where project_id = $1", [projectId]);
+          await client.query("delete from projects where id = $1", [projectId]);
+
+          const nextProjectResult = await client.query(
+            `select id, name, owner_user_id, created_at, updated_at from projects
+             where owner_user_id = $1
+             order by updated_at desc, created_at desc, id asc
+             limit 1`,
+            [userId || ""],
+          );
+          let nextProject = null;
+          let nextCanvases = [];
+          if (nextProjectResult.rowCount > 0) {
+            nextProject = rowToProject(nextProjectResult.rows[0]);
+            const nextCanvasResult = await client.query(
+              "select id, project_id, owner_user_id, name, snapshot, created_at, updated_at from canvases where project_id = $1 order by created_at asc",
+              [nextProject.id],
+            );
+            nextCanvases = nextCanvasResult.rows.map(rowToCanvas);
+          }
+          await client.query("commit");
+          return {
+            deletedProject: rowToProject(projectResult.rows[0]),
+            deletedCanvases: canvasResult.rows.map(rowToCanvas),
+            deletedAssets: assetResult.rows.map(rowToAsset),
+            nextProject,
+            nextCanvases,
+          };
         } catch (error) {
           await client.query("rollback").catch(() => {});
           throw error;

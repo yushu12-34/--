@@ -1,4 +1,4 @@
-import type { AdminOverview, AITask, SystemEventCategory, SystemEventLevel, SystemEventRecord, SystemEventSummary } from "./types";
+import type { AdminOverview, AdminUser, AITask, SystemEventCategory, SystemEventLevel, SystemEventRecord, SystemEventSummary } from "./types";
 
 const INTERNAL_API_BASE_URL = import.meta.env.VITE_INTERNAL_API_BASE_URL || "/internal";
 const INTERNAL_ADMIN_TOKEN = import.meta.env.VITE_INTERNAL_ADMIN_TOKEN || "";
@@ -23,6 +23,30 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 export function listTasks() {
   return request<{ tasks: AITask[] }>("/tasks");
+}
+
+export function listUsers() {
+  return request<{ users: AdminUser[] }>("/users");
+}
+
+export function createUser(payload: { name: string; email: string; password: string }) {
+  return request<{ user: AdminUser }>("/users", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateUser(id: string, payload: { name?: string; email?: string; password?: string }) {
+  return request<{ user: AdminUser }>(`/users/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteUser(id: string) {
+  return request<{ deleted: boolean; user: AdminUser }>(`/users/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
 }
 
 export function getOverview() {
@@ -75,6 +99,12 @@ export function updateModel(id: string, payload: Record<string, unknown>) {
   return request<{ model: Record<string, unknown> }>(`/models/${encodeURIComponent(id)}`, {
     method: "PATCH",
     body: JSON.stringify(payload),
+  });
+}
+
+export function syncSeedanceModels() {
+  return request<{ provider: Record<string, unknown>; models: Array<Record<string, unknown>> }>("/models/seedance-2/sync", {
+    method: "POST",
   });
 }
 

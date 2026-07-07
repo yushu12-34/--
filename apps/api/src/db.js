@@ -2,12 +2,17 @@ import { copyFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } f
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { id, now } from "./utils/http.js";
-import { createPostgresStore, listProjectsView, getProjectView, getCanvasView, listCanvasMembersView, listAssetsView, getTaskView, getAdminOverviewView, listAdminTasksView, getAdminTaskView, listSystemEventsView, listYjsHistoryView, getYjsHistorySnapshotView } from "./services/postgresStore.js";
+import { createPostgresStore, listProjectsView, getProjectView, getCanvasView, listCollaborativeCanvasesView, listCanvasMembersView, listAssetsView, getTaskView, getAdminOverviewView, listAdminTasksView, getAdminTaskView, listSystemEventsView, listYjsHistoryView, getYjsHistorySnapshotView, listAdminUsersView, listProvidersView, listModelsView, updateAdminUserRecord, deleteAdminUserRecord, getAuthUserByLogin, getAuthUserByTokenHash, createAuthTokenRecord, revokeAuthTokenRecord, getCanvasAccessView, getProjectAccessView, createCanvasInviteRecord, acceptCanvasInviteRecord } from "./services/postgresStore.js";
 
 const DATA_DIR = process.env.DATA_DIR || path.resolve("data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 const BACKUP_DIR = path.join(DATA_DIR, "backups");
 const DATA_BACKEND = String(process.env.DATA_BACKEND || "json").toLowerCase();
+const Z_IMAGE_API_CONFIG_VERSION = "2026-07-03-images-tasks";
+const SEEDANCE_API_CONFIG_VERSION = "2026-07-02-contents-generations-tasks";
+const Z_IMAGE_SIZE_OPTIONS = ["480p", "720p", "1k", "2k", "1280x720"];
+const Z_IMAGE_ASPECT_RATIO_OPTIONS = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9", "9:21"];
+const SEEDANCE_RATIO_OPTIONS = ["adaptive", "16:9", "4:3", "1:1", "3:4", "9:16", "21:9"];
 
 export const emptySnapshot = {
   nodes: [],
@@ -43,6 +48,22 @@ function defaultZImageProvider(timestamp) {
   };
 }
 
+function defaultSeedanceProvider(timestamp) {
+  const secretValue = process.env.ARK_API_KEY || undefined;
+  return {
+    id: "volcengine-ark",
+    name: "火山方舟 Ark",
+    type: "custom-http",
+    baseUrl: process.env.ARK_BASE_URL || "https://ark.cn-beijing.volces.com/api/v3",
+    authType: "bearer",
+    ...(secretValue ? { secretValue, secretStorage: "env:ARK_API_KEY" } : {}),
+    timeoutSeconds: 60,
+    enabled: true,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+}
+
 function defaultModel(timestamp) {
   return {
     id: "z-image-turbo",
@@ -57,24 +78,27 @@ function defaultModel(timestamp) {
       n: 1,
       response_format: "url",
       num_inference_steps: 9,
+      model: "z-image-turbo",
     },
     defaultPublicParams: {
       size: "1k",
       aspect_ratio: "1:1",
     },
     paramSchema: {
-      size: createParamSchemaConfig("尺寸", ["480p", "720p", "1k", "2k", "1280x720"], { defaultValue: "1k" }),
-      aspect_ratio: createParamSchemaConfig("宽高比", ["1:1", "16:9", "9:16", "4:3", "3:4", "21:9"], { defaultValue: "1:1" }),
+      size: createParamSchemaConfig("尺寸", Z_IMAGE_SIZE_OPTIONS, { defaultValue: "1k" }),
+      aspect_ratio: createParamSchemaConfig("宽高比", Z_IMAGE_ASPECT_RATIO_OPTIONS, { defaultValue: "1:1" }),
       n: createParamSchemaConfig("生成张数", [], { type: "number", control: "input", defaultValue: 1, publicVisible: false }),
       response_format: createParamSchemaConfig("返回格式", ["url", "b64_json"], { defaultValue: "url", publicVisible: false }),
       num_inference_steps: createParamSchemaConfig("推理步数", [], { type: "number", control: "input", defaultValue: 9, publicVisible: false }),
+      model: createParamSchemaConfig("Model", [], { defaultValue: "z-image-turbo", publicVisible: false }),
     },
     publicParamSchema: {
-      size: createParamSchemaConfig("尺寸", ["480p", "720p", "1k", "2k", "1280x720"], { defaultValue: "1k" }),
-      aspect_ratio: createParamSchemaConfig("宽高比", ["1:1", "16:9", "9:16", "4:3", "3:4", "21:9"], { defaultValue: "1:1" }),
+      size: createParamSchemaConfig("尺寸", Z_IMAGE_SIZE_OPTIONS, { defaultValue: "1k" }),
+      aspect_ratio: createParamSchemaConfig("宽高比", Z_IMAGE_ASPECT_RATIO_OPTIONS, { defaultValue: "1:1" }),
     },
     adapter: {
-      kind: "custom-http",
+      kind: "z-image-turbo",
+      configVersion: Z_IMAGE_API_CONFIG_VERSION,
       submitMethod: "POST",
       submitPath: "/v1/images/generations",
       requestTemplate: {
@@ -84,17 +108,19 @@ function defaultModel(timestamp) {
         n: "{params.n}",
         response_format: "{params.response_format}",
         num_inference_steps: "{params.num_inference_steps}",
+        model: "{params.model}",
       },
       taskIdPath: "task_id",
       pollMethod: "GET",
-      taskPathTemplate: "/v1/tasks/{task_id}",
+      taskPathTemplate: "/v1/images/tasks/{task_id}",
       statusPath: "status",
-      successStatusValues: ["finished"],
-      failureStatusValues: ["failed"],
+      successStatusValues: ["finished", "succeeded", "success", "completed", "done"],
+      failureStatusValues: ["failed", "failure", "error", "cancelled"],
       resultPath: "data.0.url",
       b64Path: "data.0.b64_json",
       errorPath: "error",
       pollIntervalMs: 2000,
+      taskNotFoundRetryMs: 60000,
       timeoutMs: 120000,
     },
     enabled: true,
@@ -118,7 +144,8 @@ function defaultZImageModel(timestamp) {
       aspect_ratio: "1:1",
       n: 1,
       response_format: "url",
-      num_inference_steps: 50,
+      num_inference_steps: 40,
+      negative_prompt: "",
       guidance_scale: 4.0,
       cfg_normalization: false,
     },
@@ -127,20 +154,22 @@ function defaultZImageModel(timestamp) {
       aspect_ratio: "1:1",
     },
     paramSchema: {
-      size: createParamSchemaConfig("尺寸", ["480p", "720p", "1k", "2k"], { defaultValue: "1k" }),
-      aspect_ratio: createParamSchemaConfig("宽高比", ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9", "9:21"], { defaultValue: "1:1" }),
+      size: createParamSchemaConfig("尺寸", Z_IMAGE_SIZE_OPTIONS, { defaultValue: "1k" }),
+      aspect_ratio: createParamSchemaConfig("宽高比", Z_IMAGE_ASPECT_RATIO_OPTIONS, { defaultValue: "1:1" }),
       n: createParamSchemaConfig("生成张数", [], { type: "number", control: "input", defaultValue: 1, publicVisible: false }),
       response_format: createParamSchemaConfig("返回格式", ["url", "b64_json"], { defaultValue: "url", publicVisible: false }),
-      num_inference_steps: createParamSchemaConfig("推理步数", [], { type: "number", control: "input", defaultValue: 50, publicVisible: false }),
+      num_inference_steps: createParamSchemaConfig("推理步数", [], { type: "number", control: "input", defaultValue: 40, publicVisible: false }),
+      negative_prompt: createParamSchemaConfig("Negative Prompt", [], { defaultValue: "", publicVisible: false }),
       guidance_scale: createParamSchemaConfig("引导强度", [], { type: "number", control: "input", defaultValue: 4, publicVisible: false }),
       cfg_normalization: createParamSchemaConfig("CFG 归一化", [], { type: "boolean", control: "checkbox", defaultValue: false, publicVisible: false }),
     },
     publicParamSchema: {
-      size: createParamSchemaConfig("尺寸", ["480p", "720p", "1k", "2k"], { defaultValue: "1k" }),
-      aspect_ratio: createParamSchemaConfig("宽高比", ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "21:9", "9:21"], { defaultValue: "1:1" }),
+      size: createParamSchemaConfig("尺寸", Z_IMAGE_SIZE_OPTIONS, { defaultValue: "1k" }),
+      aspect_ratio: createParamSchemaConfig("宽高比", Z_IMAGE_ASPECT_RATIO_OPTIONS, { defaultValue: "1:1" }),
     },
     adapter: {
-      kind: "custom-http",
+      kind: "z-image",
+      configVersion: Z_IMAGE_API_CONFIG_VERSION,
       submitMethod: "POST",
       submitPath: "/v1/images/generations",
       requestTemplate: {
@@ -150,19 +179,21 @@ function defaultZImageModel(timestamp) {
         n: "{params.n}",
         response_format: "{params.response_format}",
         num_inference_steps: "{params.num_inference_steps}",
+        negative_prompt: "{params.negative_prompt}",
         guidance_scale: "{params.guidance_scale}",
         cfg_normalization: "{params.cfg_normalization}",
       },
       taskIdPath: "task_id",
       pollMethod: "GET",
-      taskPathTemplate: "/v1/tasks/{task_id}",
+      taskPathTemplate: "/v1/images/tasks/{task_id}",
       statusPath: "status",
-      successStatusValues: ["finished"],
-      failureStatusValues: ["failed"],
+      successStatusValues: ["finished", "succeeded", "success", "completed", "done"],
+      failureStatusValues: ["failed", "failure", "error", "cancelled"],
       resultPath: "data.0.url",
       b64Path: "data.0.b64_json",
       errorPath: "error",
       pollIntervalMs: 3000,
+      taskNotFoundRetryMs: 60000,
       timeoutMs: 300000,
     },
     enabled: true,
@@ -170,6 +201,87 @@ function defaultZImageModel(timestamp) {
     sortOrder: 2,
     createdAt: timestamp,
     updatedAt: timestamp,
+  };
+}
+
+function defaultSeedanceModel(timestamp, { fast = false } = {}) {
+  const modelId = fast ? "doubao-seedance-2-0-fast-260128" : "doubao-seedance-2-0-260128";
+  const resolutionOptions = fast ? ["480p", "720p"] : ["480p", "720p", "1080p", "4k"];
+  return {
+    id: fast ? "seedance-2-fast" : "seedance-2",
+    providerId: "volcengine-ark",
+    name: modelId,
+    displayName: fast ? "Seedance 2.0 Fast" : "Seedance 2.0",
+    type: "video",
+    capabilities: ["text-to-video", "image-to-video", "video-to-video", "audio-reference", "video-with-audio"],
+    defaultParams: {
+      model: modelId,
+      resolution: "720p",
+      ratio: "adaptive",
+      duration: 5,
+      generate_audio: true,
+      watermark: false,
+      return_last_frame: false,
+      priority: 0,
+      web_search: false,
+    },
+    defaultPublicParams: {
+      resolution: "720p",
+      ratio: "adaptive",
+      duration: 5,
+      generate_audio: true,
+      watermark: false,
+      web_search: false,
+      priority: 0,
+    },
+    paramSchema: {
+      model: createParamSchemaConfig("Model", [], { defaultValue: modelId, publicVisible: false }),
+      resolution: createParamSchemaConfig("分辨率", resolutionOptions, { defaultValue: "720p" }),
+      ratio: createParamSchemaConfig("宽高比", SEEDANCE_RATIO_OPTIONS, { defaultValue: "adaptive" }),
+      duration: createParamSchemaConfig("时长(秒)", [], { type: "number", control: "input", defaultValue: 5 }),
+      generate_audio: createParamSchemaConfig("生成音频", [], { type: "boolean", control: "checkbox", defaultValue: true }),
+      watermark: createParamSchemaConfig("水印", [], { type: "boolean", control: "checkbox", defaultValue: false }),
+      return_last_frame: createParamSchemaConfig("返回尾帧", [], { type: "boolean", control: "checkbox", defaultValue: false, publicVisible: false }),
+      priority: createParamSchemaConfig("优先级", [], { type: "number", control: "input", defaultValue: 0 }),
+      web_search: createParamSchemaConfig("联网搜索", [], { type: "boolean", control: "checkbox", defaultValue: false }),
+    },
+    publicParamSchema: {
+      resolution: createParamSchemaConfig("分辨率", resolutionOptions, { defaultValue: "720p" }),
+      ratio: createParamSchemaConfig("宽高比", SEEDANCE_RATIO_OPTIONS, { defaultValue: "adaptive" }),
+      duration: createParamSchemaConfig("时长(秒)", [], { type: "number", control: "input", defaultValue: 5 }),
+      generate_audio: createParamSchemaConfig("生成音频", [], { type: "boolean", control: "checkbox", defaultValue: true }),
+      watermark: createParamSchemaConfig("水印", [], { type: "boolean", control: "checkbox", defaultValue: false }),
+      web_search: createParamSchemaConfig("联网搜索", [], { type: "boolean", control: "checkbox", defaultValue: false }),
+      priority: createParamSchemaConfig("优先级", [], { type: "number", control: "input", defaultValue: 0 }),
+    },
+    adapter: {
+      kind: "seedance-video",
+      configVersion: SEEDANCE_API_CONFIG_VERSION,
+      submitMethod: "POST",
+      submitPath: "/contents/generations/tasks",
+      taskIdPath: "id",
+      pollMethod: "GET",
+      taskPathTemplate: "/contents/generations/tasks/{task_id}",
+      statusPath: "status",
+      successStatusValues: ["succeeded"],
+      failureStatusValues: ["failed", "cancelled", "expired"],
+      resultPath: "content.video_url",
+      errorPath: "error",
+      pollIntervalMs: 10000,
+      timeoutMs: 900000,
+    },
+    enabled: true,
+    allowMockFallback: false,
+    sortOrder: fast ? 11 : 10,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+}
+
+function seedanceDefaultBundle(timestamp = now()) {
+  return {
+    provider: defaultSeedanceProvider(timestamp),
+    models: [defaultSeedanceModel(timestamp), defaultSeedanceModel(timestamp, { fast: true })],
   };
 }
 
@@ -342,7 +454,7 @@ function completeHttpAdapterConfig(model) {
     requestTemplate: buildAdapterRequestTemplate(model),
     taskIdPath: "task_id",
     pollMethod: "GET",
-    taskPathTemplate: "/v1/tasks/{task_id}",
+    taskPathTemplate: "/v1/images/tasks/{task_id}",
     statusPath: "status",
     successStatusValues: ["finished", "succeeded", "success", "completed", "done"],
     failureStatusValues: ["failed", "failure", "error", "cancelled"],
@@ -350,6 +462,7 @@ function completeHttpAdapterConfig(model) {
     b64Path: "data.0.b64_json",
     errorPath: "error",
     pollIntervalMs: 2000,
+    taskNotFoundRetryMs: 60000,
     timeoutMs: 120000,
   };
 
@@ -357,6 +470,42 @@ function completeHttpAdapterConfig(model) {
   for (const [key, value] of Object.entries(defaults)) {
     if (adapter[key] !== undefined && adapter[key] !== "") continue;
     adapter[key] = value;
+    changed = true;
+  }
+  return changed;
+}
+
+function syncBuiltInZImageModelConfig(model, timestamp) {
+  const preset = model.id === "z-image-turbo"
+    ? defaultModel(timestamp)
+    : model.id === "z-image"
+      ? defaultZImageModel(timestamp)
+      : null;
+  if (!preset) return false;
+  if (model.adapter?.configVersion === preset.adapter.configVersion) return false;
+
+  let changed = false;
+  for (const key of ["name", "displayName", "type", "capabilities", "defaultParams", "defaultPublicParams", "paramSchema", "publicParamSchema", "adapter", "allowMockFallback"]) {
+    if (isSameJson(model[key], preset[key])) continue;
+    model[key] = preset[key];
+    changed = true;
+  }
+  return changed;
+}
+
+function syncBuiltInSeedanceModelConfig(model, timestamp) {
+  const preset = model.id === "seedance-2"
+    ? defaultSeedanceModel(timestamp)
+    : model.id === "seedance-2-fast"
+      ? defaultSeedanceModel(timestamp, { fast: true })
+      : null;
+  if (!preset) return false;
+  if (model.adapter?.configVersion === preset.adapter.configVersion) return false;
+
+  let changed = false;
+  for (const key of ["name", "displayName", "type", "capabilities", "defaultParams", "defaultPublicParams", "paramSchema", "publicParamSchema", "adapter", "allowMockFallback"]) {
+    if (isSameJson(model[key], preset[key])) continue;
+    model[key] = preset[key];
     changed = true;
   }
   return changed;
@@ -458,6 +607,8 @@ export function createDefaultDb(timestamp = now()) {
   return {
     users: [defaultUser(timestamp)],
     userDevices: [],
+    authTokens: [],
+    canvasInvites: [],
     projectMembers: [],
     canvasMembers: [],
     projects: [],
@@ -467,8 +618,8 @@ export function createDefaultDb(timestamp = now()) {
     systemEvents: [],
     workflowUpdates: [],
     workflowSnapshots: [],
-    providers: [defaultProvider(timestamp), defaultZImageProvider(timestamp)],
-    models: [defaultModel(timestamp), defaultZImageModel(timestamp)],
+    providers: [defaultProvider(timestamp), defaultZImageProvider(timestamp), defaultSeedanceProvider(timestamp)],
+    models: [defaultModel(timestamp), defaultZImageModel(timestamp), defaultSeedanceModel(timestamp), defaultSeedanceModel(timestamp, { fast: true })],
   };
 }
 
@@ -477,6 +628,8 @@ export function normalizeDb(db, timestamp = now()) {
   let changed = false;
   if (!Array.isArray(db.users) || db.users.length === 0) { db.users = [defaultUser(timestamp)]; changed = true; }
   if (!Array.isArray(db.userDevices)) { db.userDevices = []; changed = true; }
+  if (!Array.isArray(db.authTokens)) { db.authTokens = []; changed = true; }
+  if (!Array.isArray(db.canvasInvites)) { db.canvasInvites = []; changed = true; }
   if (!Array.isArray(db.projectMembers)) { db.projectMembers = []; changed = true; }
   if (!Array.isArray(db.canvasMembers)) { db.canvasMembers = []; changed = true; }
   if (!Array.isArray(db.providers)) { db.providers = []; changed = true; }
@@ -509,6 +662,11 @@ export function normalizeDb(db, timestamp = now()) {
     changed = true;
   }
 
+  if (!db.providers.some((provider) => provider.id === "volcengine-ark")) {
+    db.providers.push(defaultSeedanceProvider(timestamp));
+    changed = true;
+  }
+
   if (!db.models.some((model) => model.id === "z-image-turbo")) {
     db.models.push(defaultModel(timestamp));
     changed = true;
@@ -519,7 +677,25 @@ export function normalizeDb(db, timestamp = now()) {
     changed = true;
   }
 
+  if (!db.models.some((model) => model.id === "seedance-2")) {
+    db.models.push(defaultSeedanceModel(timestamp));
+    changed = true;
+  }
+
+  if (!db.models.some((model) => model.id === "seedance-2-fast")) {
+    db.models.push(defaultSeedanceModel(timestamp, { fast: true }));
+    changed = true;
+  }
+
   for (const model of db.models) {
+    if (syncBuiltInZImageModelConfig(model, timestamp)) {
+      model.updatedAt = timestamp;
+      changed = true;
+    }
+    if (syncBuiltInSeedanceModelConfig(model, timestamp)) {
+      model.updatedAt = timestamp;
+      changed = true;
+    }
     if (!model.publicParamSchema) {
       model.publicParamSchema = model.paramSchema || {};
       model.updatedAt = timestamp;
@@ -567,7 +743,10 @@ const POSTGRES_REACHABLE_CACHE_MS = 15_000;
 
 async function isPostgresBackend() {
   const configured = DATA_BACKEND === "postgres" || DATA_BACKEND === "postgresql";
-  if (!configured || !process.env.DATABASE_URL) return false;
+  if (!configured) return false;
+  if (!process.env.DATABASE_URL) {
+    throw new Error("PostgreSQL backend is required but DATABASE_URL is not set");
+  }
   const now = Date.now();
   if (postgresReachable !== null && now - postgresReachableCheckedAt < POSTGRES_REACHABLE_CACHE_MS) {
     return postgresReachable;
@@ -579,8 +758,11 @@ async function isPostgresBackend() {
     const client = await pool.connect();
     client.release();
     postgresReachable = true;
-  } catch {
+  } catch (error) {
     postgresReachable = false;
+    if (configured) {
+      throw new Error(`PostgreSQL backend is required but unreachable: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   postgresReachableCheckedAt = now;
   return postgresReachable;
@@ -601,6 +783,7 @@ export {
   listProjectsView,
   getProjectView,
   getCanvasView,
+  listCollaborativeCanvasesView,
   listCanvasMembersView,
   listAssetsView,
   getTaskView,
@@ -610,6 +793,11 @@ export {
   listSystemEventsView,
   listYjsHistoryView,
   getYjsHistorySnapshotView,
+  listAdminUsersView,
+  listProvidersView,
+  listModelsView,
+  updateAdminUserRecord,
+  deleteAdminUserRecord,
 };
 
 let readCache = null;
@@ -780,9 +968,9 @@ export async function updateJson(mutator) {
 
 // 直接更新单个 canvas 的 snapshot，避免 updateJson 的全表重写。
 // 仅在 PostgreSQL 模式下生效；JSON 模式回退到 updateJson。
-export async function updateCanvasSnapshot(canvasId, snapshot, updatedAt) {
+export async function updateCanvasSnapshot(canvasId, snapshot, updatedAt, options = {}) {
   if (await isPostgresBackend()) {
-    const result = await getPostgresStore().updateCanvasSnapshot(canvasId, snapshot, updatedAt);
+    const result = await getPostgresStore().updateCanvasSnapshot(canvasId, snapshot, updatedAt, options);
     if (result) updateCacheEntry("canvases", canvasId, (existing) => ({ ...(existing || result), ...result, snapshot: snapshot || emptySnapshot, updatedAt }));
     return result;
   }
@@ -871,6 +1059,49 @@ export async function updateProvider(providerId, patch) {
   });
 }
 
+export async function upsertSeedanceDefaults() {
+  const timestamp = now();
+  const bundle = seedanceDefaultBundle(timestamp);
+  const result = await updateJson((db) => {
+    if (!Array.isArray(db.providers)) db.providers = [];
+    if (!Array.isArray(db.models)) db.models = [];
+
+    const existingProvider = db.providers.find((provider) => provider.id === bundle.provider.id);
+    if (existingProvider) {
+      const preservedSecret = existingProvider.secretValue || existingProvider.secret || existingProvider.encryptedSecret;
+      Object.assign(existingProvider, {
+        ...bundle.provider,
+        secretValue: bundle.provider.secretValue || preservedSecret,
+        secretStorage: bundle.provider.secretStorage || (preservedSecret ? existingProvider.secretStorage || "plain-local-json" : undefined),
+        createdAt: existingProvider.createdAt || bundle.provider.createdAt,
+        updatedAt: timestamp,
+      });
+    } else {
+      db.providers.push(bundle.provider);
+    }
+
+    const models = [];
+    for (const seedanceModel of bundle.models) {
+      const existingModel = db.models.find((model) => model.id === seedanceModel.id);
+      if (existingModel) {
+        Object.assign(existingModel, {
+          ...seedanceModel,
+          enabled: existingModel.enabled !== false,
+          createdAt: existingModel.createdAt || seedanceModel.createdAt,
+          updatedAt: timestamp,
+        });
+        models.push(existingModel);
+      } else {
+        db.models.push(seedanceModel);
+        models.push(seedanceModel);
+      }
+    }
+    return { provider: existingProvider || bundle.provider, models };
+  });
+  readCache = null;
+  return result;
+}
+
 // 直接插入 user，避免 updateJson 的全表重写。
 export async function createUser(user) {
   if (await isPostgresBackend()) {
@@ -886,6 +1117,146 @@ export async function createUser(user) {
 }
 
 // 直接插入 project，避免 updateJson 的全表重写。
+export async function findUserForLogin(login) {
+  if (await isPostgresBackend()) return getAuthUserByLogin(login);
+  const db = await readJson();
+  const normalized = String(login || "").trim().toLowerCase();
+  return (db.users || []).find((user) => (
+    String(user.email || "").toLowerCase() === normalized
+    || String(user.id || "") === String(login || "").trim()
+  )) || null;
+}
+
+export async function getUserByAuthTokenHash(tokenHash) {
+  if (await isPostgresBackend()) return getAuthUserByTokenHash(tokenHash);
+  const timestamp = now();
+  return updateJson((db) => {
+    if (!Array.isArray(db.authTokens)) db.authTokens = [];
+    const token = db.authTokens.find((item) => item.tokenHash === tokenHash);
+    if (!token || new Date(token.expiresAt).getTime() <= Date.now()) return null;
+    token.lastUsedAt = timestamp;
+    return (db.users || []).find((user) => user.id === token.userId) || null;
+  });
+}
+
+export async function createAuthToken(tokenHash, userId, expiresAt, createdAt = now()) {
+  if (await isPostgresBackend()) {
+    await createAuthTokenRecord(tokenHash, userId, expiresAt, createdAt);
+    return { tokenHash, userId, expiresAt, createdAt, lastUsedAt: createdAt };
+  }
+  return updateJson((db) => {
+    if (!Array.isArray(db.authTokens)) db.authTokens = [];
+    const record = { tokenHash, userId, expiresAt, createdAt, lastUsedAt: createdAt };
+    db.authTokens.push(record);
+    return record;
+  });
+}
+
+export async function revokeAuthToken(tokenHash) {
+  if (await isPostgresBackend()) {
+    await revokeAuthTokenRecord(tokenHash);
+    return true;
+  }
+  return updateJson((db) => {
+    if (!Array.isArray(db.authTokens)) db.authTokens = [];
+    const before = db.authTokens.length;
+    db.authTokens = db.authTokens.filter((item) => item.tokenHash !== tokenHash);
+    return db.authTokens.length !== before;
+  });
+}
+
+function getJsonCanvasAccess(db, canvasId, userId) {
+  const canvas = (db.canvases || []).find((item) => item.id === canvasId);
+  if (!canvas) return null;
+  if (canvas.ownerId === userId) {
+    return { exists: true, allowed: true, role: "owner", canvasId, projectId: canvas.projectId, ownerId: canvas.ownerId };
+  }
+  const member = (db.canvasMembers || []).find((item) => item.canvasId === canvasId && item.userId === userId);
+  if (member) {
+    return { exists: true, allowed: true, role: member.role || "viewer", canvasId, projectId: canvas.projectId, ownerId: canvas.ownerId };
+  }
+  return { exists: true, allowed: false, canvasId, projectId: canvas.projectId, ownerId: canvas.ownerId };
+}
+
+export async function getCanvasAccess(canvasId, userId) {
+  if (await isPostgresBackend()) return getCanvasAccessView(canvasId, userId);
+  return getJsonCanvasAccess(await readJson(), canvasId, userId);
+}
+
+export async function getProjectAccess(projectId, userId) {
+  if (await isPostgresBackend()) return getProjectAccessView(projectId, userId);
+  const db = await readJson();
+  const project = (db.projects || []).find((item) => item.id === projectId);
+  if (!project) return null;
+  if (project.ownerId === userId) return { exists: true, allowed: true, role: "owner" };
+  const projectMember = (db.projectMembers || []).find((item) => item.projectId === projectId && item.userId === userId);
+  if (projectMember) return { exists: true, allowed: true, role: projectMember.role || "viewer" };
+  return { exists: true, allowed: false, role: null };
+}
+
+export async function listCollaborativeCanvases(userId) {
+  if (await isPostgresBackend()) return listCollaborativeCanvasesView(userId);
+  const db = await readJson();
+  const users = new Map((db.users || []).map((user) => [user.id, user]));
+  const projects = new Map((db.projects || []).map((project) => [project.id, project]));
+  return (db.canvasMembers || [])
+    .filter((member) => member.userId === userId)
+    .map((member) => {
+      const canvas = (db.canvases || []).find((item) => item.id === member.canvasId);
+      if (!canvas || canvas.ownerId === userId) return null;
+      const owner = users.get(canvas.ownerId) || { id: canvas.ownerId, name: canvas.ownerId };
+      const project = projects.get(canvas.projectId);
+      return {
+        canvas,
+        role: member.role || "viewer",
+        addedAt: member.addedAt,
+        projectName: project?.name,
+        owner: {
+          id: owner.id,
+          name: owner.name || owner.displayName || owner.id,
+          email: owner.email,
+        },
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => new Date(right.canvas.updatedAt).getTime() - new Date(left.canvas.updatedAt).getTime());
+}
+
+export async function createCanvasInvite(invite) {
+  if (await isPostgresBackend()) return createCanvasInviteRecord(invite);
+  return updateJson((db) => {
+    if (!Array.isArray(db.canvasInvites)) db.canvasInvites = [];
+    const record = { ...invite, usedCount: 0 };
+    db.canvasInvites.push(record);
+    return record;
+  });
+}
+
+export async function acceptCanvasInvite(code, userId, acceptedAt = now()) {
+  if (await isPostgresBackend()) return acceptCanvasInviteRecord(code, userId, acceptedAt);
+  return updateJson((db) => {
+    if (!Array.isArray(db.canvasInvites)) db.canvasInvites = [];
+    if (!Array.isArray(db.canvasMembers)) db.canvasMembers = [];
+    const invite = db.canvasInvites.find((item) => item.code === code);
+    if (!invite) return null;
+    const canvas = db.canvases.find((item) => item.id === invite.canvasId);
+    if (!canvas) return { invite, error: "canvas_not_found" };
+    if (canvas.ownerId === userId) return { invite, member: { canvasId: canvas.id, userId, role: "owner", addedAt: acceptedAt } };
+    const existing = db.canvasMembers.find((item) => item.canvasId === canvas.id && item.userId === userId);
+    if (existing) {
+      return { invite, member: { canvasId: canvas.id, userId, role: existing.role || "viewer", addedAt: existing.addedAt || acceptedAt } };
+    }
+    const expired = invite.expiresAt && new Date(invite.expiresAt).getTime() <= Date.now();
+    const overUsed = invite.maxUses !== undefined && Number(invite.usedCount || 0) >= Number(invite.maxUses);
+    if (invite.revokedAt || expired || overUsed) {
+      return { invite, error: expired ? "expired" : overUsed ? "used_up" : "revoked" };
+    }
+    db.canvasMembers.push({ canvasId: canvas.id, userId, role: invite.role, addedAt: acceptedAt });
+    invite.usedCount = Number(invite.usedCount || 0) + 1;
+    return { invite, member: { canvasId: canvas.id, userId, role: invite.role, addedAt: acceptedAt } };
+  });
+}
+
 export async function createProject(project) {
   if (await isPostgresBackend()) {
     const result = await getPostgresStore().createProject(project);
@@ -899,6 +1270,19 @@ export async function createProject(project) {
 }
 
 // 直接插入 canvas，避免 updateJson 的全表重写。
+export async function createProjectWithCanvas(project, canvas) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().createProjectWithCanvas(project, canvas);
+    addCacheEntry("projects", result.project);
+    addCacheEntry("canvases", result.canvas);
+    return result;
+  }
+  return updateJson((db) => {
+    db.projects.push(project);
+    db.canvases.push(canvas);
+    return { project, canvas };
+  });
+}
 export async function createCanvas(canvas) {
   if (await isPostgresBackend()) {
     const result = await getPostgresStore().createCanvas(canvas);
@@ -964,5 +1348,184 @@ export async function appendSystemEventDirect(event) {
     db.systemEvents.unshift(event);
     db.systemEvents = db.systemEvents.slice(0, 500);
     return event;
+  });
+}
+
+// 直接查询单个 canvas 的 Yjs 持久化数据，避免 readJson() 全库加载。
+// 用于 collaborationService.getRoomYDoc 的按需加载。
+export async function getCanvasYjsPersistenceDirect(canvasId) {
+  if (await isPostgresBackend()) {
+    return getPostgresStore().getCanvasYjsPersistence(canvasId);
+  }
+  // JSON 后备：动态导入以避免与 yjsPersistenceService 的循环依赖
+  const { getCanvasYjsPersistence } = await import("./services/yjsPersistenceService.js");
+  const db = await readJson();
+  return getCanvasYjsPersistence(db, canvasId);
+}
+
+// 直接更新单个 project，避免 updateJson 全表重写。
+export async function updateProject(projectId, patch) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().updateProject(projectId, patch);
+    if (result) updateCacheEntry("projects", projectId, (existing) => ({ ...(existing || result), ...result }));
+    return result;
+  }
+  return updateJson((db) => {
+    const project = db.projects.find((item) => item.id === projectId);
+    if (!project) return null;
+    if ("name" in patch) project.name = String(patch.name || project.name);
+    project.updatedAt = now();
+    return project;
+  });
+}
+
+// 直接更新 canvas 元数据（名称），避免 updateJson 全表重写。
+export async function updateCanvasMeta(canvasId, patch) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().updateCanvasMeta(canvasId, patch);
+    if (result) updateCacheEntry("canvases", canvasId, (existing) => ({ ...(existing || result), ...result }));
+    return result;
+  }
+  return updateJson((db) => {
+    const canvas = db.canvases.find((item) => item.id === canvasId);
+    if (!canvas) return null;
+    if ("name" in patch) canvas.name = String(patch.name || canvas.name);
+    canvas.updatedAt = now();
+    return canvas;
+  });
+}
+
+// 直接删除 canvas（含成员清理），避免 updateJson 全表重写。
+export async function deleteProjectDirect(projectId, userId) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().deleteProjectGraph(projectId, userId);
+    if (result) {
+      removeCacheEntries("projects", (item) => item?.id === projectId);
+      const deletedCanvasIds = new Set((result.deletedCanvases || []).map((canvas) => canvas.id));
+      removeCacheEntries("canvases", (item) => deletedCanvasIds.has(item?.id));
+      removeCacheEntries("assets", (item) => item?.projectId === projectId);
+      removeCacheEntries("canvasMembers", (item) => deletedCanvasIds.has(item?.canvasId));
+      removeCacheEntries("workflowUpdates", (item) => deletedCanvasIds.has(item?.canvasId));
+      removeCacheEntries("workflowSnapshots", (item) => deletedCanvasIds.has(item?.canvasId));
+    }
+    return result;
+  }
+  return null;
+}
+
+export async function deleteCanvasDirect(canvasId) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().deleteCanvas(canvasId);
+    if (result) {
+      removeCacheEntries("canvases", (item) => item?.id === canvasId);
+      removeCacheEntries("canvasMembers", (m) => m?.canvasId === canvasId);
+    }
+    return result;
+  }
+  return updateJson((db) => {
+    const canvas = db.canvases.find((item) => item.id === canvasId);
+    if (!canvas) return null;
+    db.canvases = db.canvases.filter((item) => item.id !== canvasId);
+    if (Array.isArray(db.canvasMembers)) {
+      db.canvasMembers = db.canvasMembers.filter((m) => m.canvasId !== canvasId);
+    }
+    return canvas;
+  });
+}
+
+// 直接 upsert canvas 成员，避免 updateJson 全表重写。
+export async function upsertCanvasMember(canvasId, userId, role, addedAt) {
+  if (await isPostgresBackend()) {
+    const member = await getPostgresStore().upsertCanvasMember(canvasId, userId, role, addedAt);
+    if (member) {
+      addCacheEntry("canvasMembers", member);
+    }
+    return member;
+  }
+  return updateJson((db) => {
+    if (!Array.isArray(db.canvasMembers)) db.canvasMembers = [];
+    const existing = db.canvasMembers.find((m) => m.canvasId === canvasId && m.userId === userId);
+    if (existing) {
+      existing.role = role;
+      existing.addedAt = addedAt;
+    } else {
+      db.canvasMembers.push({ canvasId, userId, role, addedAt });
+    }
+    return { canvasId, userId, role, addedAt };
+  });
+}
+
+// 直接删除 canvas 成员，避免 updateJson 全表重写。
+export async function removeCanvasMember(canvasId, userId) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().removeCanvasMember(canvasId, userId);
+    if (result) {
+      removeCacheEntries("canvasMembers", (m) => m?.canvasId === canvasId && m?.userId === userId);
+    }
+    return result;
+  }
+  return updateJson((db) => {
+    if (!Array.isArray(db.canvasMembers)) return null;
+    const existing = db.canvasMembers.find((m) => m.canvasId === canvasId && m.userId === userId);
+    if (!existing) return null;
+    db.canvasMembers = db.canvasMembers.filter((m) => !(m.canvasId === canvasId && m.userId === userId));
+    return { canvasId, userId };
+  });
+}
+
+// 直接更新 asset，避免 updateJson 全表重写。
+export async function updateAsset(assetId, patch) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().updateAsset(assetId, patch);
+    if (result) updateCacheEntry("assets", assetId, (existing) => ({ ...(existing || result), ...result }));
+    return result;
+  }
+  return updateJson((db) => {
+    const asset = db.assets.find((item) => item.id === assetId);
+    if (!asset) return null;
+    if ("name" in patch) asset.name = String(patch.name || "");
+    asset.updatedAt = now();
+    return asset;
+  });
+}
+
+// 直接删除 asset，避免 updateJson 全表重写。
+export async function deleteAssetDirect(assetId) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().deleteAsset(assetId);
+    if (result) removeCacheEntries("assets", (item) => item?.id === assetId);
+    return result;
+  }
+  return updateJson((db) => {
+    const asset = db.assets.find((item) => item.id === assetId);
+    if (!asset) return null;
+    db.assets = db.assets.filter((item) => item.id !== assetId);
+    return asset;
+  });
+}
+
+// 直接创建 provider，避免 updateJson 全表重写。
+export async function createProvider(provider) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().createProvider(provider);
+    if (result) addCacheEntry("providers", provider);
+    return result;
+  }
+  return updateJson((db) => {
+    db.providers.push(provider);
+    return provider;
+  });
+}
+
+// 直接创建 model，避免 updateJson 全表重写。
+export async function createModel(model) {
+  if (await isPostgresBackend()) {
+    const result = await getPostgresStore().createModel(model);
+    if (result) addCacheEntry("models", model);
+    return result;
+  }
+  return updateJson((db) => {
+    db.models.push(model);
+    return model;
   });
 }

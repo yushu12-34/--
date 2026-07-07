@@ -1,5 +1,6 @@
 import type { CanvasSnapshot } from "./types";
 import { createCollaborationAwarenessBridge, type CollaborationAwarenessWireState } from "./collaborationAwareness";
+import { getApiBaseUrl, getAuthToken } from "./api";
 
 export interface CollaborationUser {
   id: string;
@@ -23,7 +24,8 @@ type CollaborationMessage =
   | { type: "snapshot:request"; requesterId?: string }
   | { type: "yjs:state-vector"; stateVector: string }
   | { type: "yjs:sync"; update: string; stateVector?: string; sourceUserId?: string }
-  | { type: "yjs:update"; update: string; sourceUserId?: string };
+  | { type: "yjs:update"; update: string; sourceUserId?: string }
+  | { type: "access:revoked"; userId?: string };
 
 interface CollaborationClientOptions {
   canvasId: string;
@@ -35,12 +37,13 @@ interface CollaborationClientOptions {
   getYjsStateVector?: () => Uint8Array | null;
   getYjsDiffUpdate?: (stateVector: Uint8Array) => Uint8Array | null;
   onStatus?: (status: CollaborationStatus) => void;
+  onAccessRevoked?: () => void;
 }
 
 function getWsBaseUrl() {
   const configured = import.meta.env.VITE_COLLAB_WS_URL;
   if (configured) return String(configured).replace(/\/+$/, "");
-  const apiBase = String(import.meta.env.VITE_API_BASE_URL || "/api");
+  const apiBase = getApiBaseUrl();
   if (/^https?:\/\//i.test(apiBase)) {
     return apiBase.replace(/^http/i, "ws").replace(/\/api\/?$/, "/api/collaboration");
   }
@@ -65,15 +68,31 @@ function base64ToBytes(value: string) {
   return bytes;
 }
 
-export function createCollaborationClient({ canvasId, user, onUsers, getSnapshot, onSnapshot, onYjsUpdate, getYjsStateVector, getYjsDiffUpdate, onStatus }: CollaborationClientOptions) {
-  const sessionUser = { ...user, id: `${user.id}:${crypto.randomUUID()}` };
+function createSessionId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0"));
+    return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+export function createCollaborationClient({ canvasId, user, onUsers, getSnapshot, onSnapshot, onYjsUpdate, getYjsStateVector, getYjsDiffUpdate, onStatus, onAccessRevoked }: CollaborationClientOptions) {
+  const sessionUser = { ...user, id: `${user.id}:${createSessionId()}` };
   const awarenessBridge = createCollaborationAwarenessBridge(sessionUser);
   let users = new Map<string, CollaborationUser>();
   let socket: WebSocket | null = null;
   let closedByClient = false;
   let reconnectTimer = 0;
+  let joinTimer = 0;
   let reconnectAttempt = 0;
   let lastPresence: Partial<CollaborationUser> = {};
+  let joined = false;
 
   const emitUsers = () => onUsers([...users.values()].filter((item) => item.id !== sessionUser.id));
   const send = (payload: unknown) => {
@@ -87,25 +106,50 @@ export function createCollaborationClient({ canvasId, user, onUsers, getSnapshot
       send({ type: "snapshot:update", snapshot, version: Date.now() });
     }
   };
+  const sendJoinHandshake = () => {
+    send({ type: "presence:join", user: sessionUser });
+    send({ type: "awareness:update", state: awarenessBridge.getLocalWireState() });
+    if (Object.keys(lastPresence).length) send({ type: "presence:update", presence: lastPresence });
+    const stateVector = getYjsStateVector?.();
+    if (stateVector) send({ type: "yjs:state-vector", stateVector: bytesToBase64(stateVector) });
+  };
 
   const connect = () => {
     onStatus?.(reconnectAttempt > 0 ? "reconnecting" : "connecting");
-    socket = new WebSocket(`${getWsBaseUrl()}?canvasId=${encodeURIComponent(canvasId)}`);
+    const token = getAuthToken();
+    const params = new URLSearchParams({ canvasId });
+    if (token) params.set("token", token);
+    else params.set("userId", user.id.split(":")[0] || user.id);
+    socket = new WebSocket(`${getWsBaseUrl()}?${params.toString()}`);
 
     socket.addEventListener("open", () => {
       reconnectAttempt = 0;
+      joined = false;
       onStatus?.("connected");
-      send({ type: "presence:join", user: sessionUser });
-      send({ type: "awareness:update", state: awarenessBridge.getLocalWireState() });
-      if (Object.keys(lastPresence).length) send({ type: "presence:update", presence: lastPresence });
-      const stateVector = getYjsStateVector?.();
-      if (stateVector) send({ type: "yjs:state-vector", stateVector: bytesToBase64(stateVector) });
-      window.setTimeout(sendCurrentSnapshot, 120);
+      sendJoinHandshake();
+      window.clearInterval(joinTimer);
+      joinTimer = window.setInterval(() => {
+        if (joined) {
+          window.clearInterval(joinTimer);
+          return;
+        }
+        sendJoinHandshake();
+      }, 500);
     });
 
     socket.addEventListener("message", (event) => {
-      const payload = JSON.parse(String(event.data)) as CollaborationMessage;
+      let payload: CollaborationMessage;
+      try {
+        payload = JSON.parse(String(event.data)) as CollaborationMessage;
+      } catch {
+        return;
+      }
       if (payload.type === "presence:list") {
+        if (!joined) {
+          joined = true;
+          window.clearInterval(joinTimer);
+          window.setTimeout(sendCurrentSnapshot, 80);
+        }
         users = new Map(payload.users.map((item) => [item.id, item]));
         emitUsers();
       }
@@ -147,9 +191,21 @@ export function createCollaborationClient({ canvasId, user, onUsers, getSnapshot
           if (diffUpdate) send({ type: "yjs:update", update: bytesToBase64(diffUpdate) });
         }
       }
+      if (payload.type === "access:revoked") {
+        const revokedUserId = String(payload.userId || "").split(":")[0];
+        const currentUserId = String(user.id || "").split(":")[0];
+        if (!revokedUserId || revokedUserId === currentUserId) {
+          closedByClient = true;
+          onStatus?.("offline");
+          onAccessRevoked?.();
+          socket?.close();
+        }
+      }
     });
 
     socket.addEventListener("close", () => {
+      window.clearInterval(joinTimer);
+      joined = false;
       users.clear();
       emitUsers();
       if (closedByClient) {
@@ -189,6 +245,7 @@ export function createCollaborationClient({ canvasId, user, onUsers, getSnapshot
     close() {
       closedByClient = true;
       window.clearTimeout(reconnectTimer);
+      window.clearInterval(joinTimer);
       awarenessBridge.destroy();
       socket?.close();
       socket = null;

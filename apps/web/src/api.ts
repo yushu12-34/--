@@ -1,17 +1,51 @@
-import type { AITask, AssetRecord, CanvasMemberRecord, CanvasRecord, CanvasSnapshot, ProjectBundle, ProjectRecord, UserRecord, YjsSnapshotDetail, YjsSnapshotRecord } from "./types";
+import type { AITask, AssetRecord, CanvasAccessRecord, CanvasMemberRecord, CanvasRecord, CanvasSnapshot, CollaborativeCanvasRecord, ProjectBundle, ProjectRecord, UserRecord, YjsSnapshotDetail, YjsSnapshotRecord } from "./types";
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "/api";
+const RAW_API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "/api";
+
+export function getApiBaseUrl(): string {
+  const value = String(RAW_API_BASE_URL);
+  if (!/^https?:\/\//i.test(value)) return value;
+  try {
+    const url = new URL(value);
+    const isLocalHost = ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
+    if (isLocalHost && typeof window !== "undefined" && !["localhost", "127.0.0.1", "::1"].includes(window.location.hostname)) {
+      url.hostname = window.location.hostname;
+    }
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return value;
+  }
+}
+
+export function getAuthToken(): string {
+  return String(sessionStorage.getItem("anime-canvas-auth-token") || localStorage.getItem("anime-canvas-auth-token") || "");
+}
+
+export function setAuthToken(token: string) {
+  if (token) {
+    localStorage.setItem("anime-canvas-auth-token", token);
+    sessionStorage.setItem("anime-canvas-auth-token", token);
+  } else {
+    localStorage.removeItem("anime-canvas-auth-token");
+    sessionStorage.removeItem("anime-canvas-auth-token");
+  }
+}
 
 function getCurrentUserId(): string {
-  return String(localStorage.getItem("anime-canvas-active-user-id") || "default-user");
+  return String(sessionStorage.getItem("anime-canvas-active-user-id") || localStorage.getItem("anime-canvas-active-user-id") || "");
+}
+
+function userScopedStorageKey(key: string, userId = getCurrentUserId()) {
+  return userId ? `${key}:${userId}` : key;
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
+  const response = await fetch(`${getApiBaseUrl()}${path}`, {
     ...options,
     headers: {
       "content-type": "application/json",
       "x-user-id": getCurrentUserId(),
+      ...(getAuthToken() ? { authorization: `Bearer ${getAuthToken()}` } : {}),
       ...(options.headers || {}),
     },
   });
@@ -20,6 +54,28 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     throw new Error(payload.error || payload.message || `HTTP ${response.status}`);
   }
   return response.json() as Promise<T>;
+}
+
+export function getCurrentSession() {
+  return request<{ user: UserRecord }>("/auth/me");
+}
+
+export function registerUser(payload: { name: string; email: string; password: string }) {
+  return request<{ user: UserRecord; token: string }>("/auth/register", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function loginUser(payload: { email: string; password: string }) {
+  return request<{ user: UserRecord; token: string }>("/auth/login", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function logoutUser() {
+  return request<{ ok: boolean }>("/auth/logout", { method: "POST" }).finally(() => setAuthToken(""));
 }
 
 export function listUsers() {
@@ -35,6 +91,10 @@ export function createUser(name: string) {
 
 export function listProjects() {
   return request<{ projects: ProjectRecord[] }>("/projects");
+}
+
+export function listCollaborativeCanvases() {
+  return request<{ canvases: CollaborativeCanvasRecord[] }>("/collaboration/canvases");
 }
 
 export function getProject(projectId: string) {
@@ -80,24 +140,26 @@ export function importProject(bundle: ProjectBundle, name?: string, ownerId?: st
 }
 
 export async function ensureProject(ownerId = "default-user") {
-  const existingId = localStorage.getItem("anime-canvas-project-id");
+  const projectStorageKey = userScopedStorageKey("anime-canvas-project-id", ownerId);
+  const existingId = localStorage.getItem(projectStorageKey) || localStorage.getItem("anime-canvas-project-id");
   if (existingId) {
     try {
       return await getProject(existingId);
     } catch {
-      localStorage.removeItem("anime-canvas-project-id");
+      localStorage.removeItem(projectStorageKey);
+      if (localStorage.getItem("anime-canvas-project-id") === existingId) localStorage.removeItem("anime-canvas-project-id");
     }
   }
 
   const listed = await listProjects();
   const existingProject = listed.projects[0];
   if (existingProject) {
-    localStorage.setItem("anime-canvas-project-id", existingProject.id);
+    localStorage.setItem(projectStorageKey, existingProject.id);
     return getProject(existingProject.id);
   }
 
   const created = await createProject("我的动漫项目", ownerId);
-  localStorage.setItem("anime-canvas-project-id", created.project.id);
+  localStorage.setItem(projectStorageKey, created.project.id);
   return { project: created.project, canvases: [created.canvas] };
 }
 
@@ -125,8 +187,33 @@ export function removeCanvasMember(canvasId: string, userId: string) {
   });
 }
 
+export interface CanvasInviteRecord {
+  id: string;
+  canvasId: string;
+  ownerId: string;
+  code: string;
+  role: "editor" | "viewer";
+  maxUses?: number;
+  usedCount: number;
+  expiresAt?: string;
+  createdAt: string;
+}
+
+export function createCanvasInvite(canvasId: string, payload: { role?: "editor" | "viewer"; expiresHours?: number; maxUses?: number } = {}) {
+  return request<{ invite: CanvasInviteRecord }>(`/canvases/${encodeURIComponent(canvasId)}/invites`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function acceptCanvasInvite(code: string) {
+  return request<{ invite: CanvasInviteRecord; member: CanvasMemberRecord; canvas?: CanvasRecord }>(`/invites/${encodeURIComponent(code)}/accept`, {
+    method: "POST",
+  });
+}
+
 export function getCanvas(canvasId: string) {
-  return request<{ canvas: CanvasRecord }>(`/canvases/${canvasId}`);
+  return request<{ canvas: CanvasRecord; access?: CanvasAccessRecord }>(`/canvases/${canvasId}`);
 }
 
 export function updateCanvas(canvasId: string, payload: { name?: string }) {
@@ -156,8 +243,9 @@ export function saveSnapshot(canvasId: string, snapshot: CanvasSnapshot, options
   });
 }
 
-export function saveSnapshotJson(canvasId: string, bodyJson: string) {
-  return request<{ canvas: CanvasRecord }>(`/canvases/${canvasId}/snapshot`, {
+export function saveSnapshotJson(canvasId: string, bodyJson: string, options: { minimal?: boolean } = {}) {
+  const query = options.minimal ? "?minimal=1" : "";
+  return request<{ canvas?: CanvasRecord; ok?: boolean; updatedAt?: string }>(`/canvases/${encodeURIComponent(canvasId)}/snapshot${query}`, {
     method: "PUT",
     body: bodyJson,
   });
@@ -181,7 +269,7 @@ export function listAssets(projectId: string) {
   return request<{ assets: AssetRecord[] }>(`/assets?projectId=${encodeURIComponent(projectId)}`);
 }
 
-export function createAsset(payload: Partial<AssetRecord> & { projectId: string; type: string; url: string }) {
+export function createAsset(payload: Partial<AssetRecord> & { projectId: string; canvasId?: string; type: string; url: string }) {
   return request<{ asset: AssetRecord }>("/assets", {
     method: "POST",
     body: JSON.stringify(payload),

@@ -65,7 +65,7 @@ try {
     const message = error instanceof Error ? error.message : String(error);
     const code = error && typeof error === "object" && "code" in error ? ` (${error.code})` : "";
     console.error(`PostgreSQL connection failed${code}: ${message}`);
-    console.error("Check that DATABASE_URL uses the server LAN IP/host, port 5432 is reachable, and the app user password is correct.");
+    console.error("Check that DATABASE_URL uses the server LAN IP/host, port 5433 is reachable, and the app user password is correct.");
     process.exit(1);
   }
   try {

@@ -1,6 +1,6 @@
-import { readJsonQueued, createTask, updateTask, createAsset } from "../db.js";
+import { readJsonQueued, createTask, updateTask, createAsset, usePostgresBackend, getTaskView, listModelsView, listProvidersView } from "../db.js";
 import { id, now } from "../utils/http.js";
-import { createMockImageResult, generateImageWithModel } from "./imageGeneration.js";
+import { createMockImageResult, generateImageWithModel, generateVideoWithModel } from "./imageGeneration.js";
 import { enqueueTask } from "./queueService.js";
 import { storeGeneratedAsset } from "./storageService.js";
 import { recordSystemEvent } from "./systemEventService.js";
@@ -8,6 +8,11 @@ import { recordSystemEvent } from "./systemEventService.js";
 const runningTasks = new Set();
 const DEFAULT_TASK_TIMEOUT_MS = 120000;
 const DEFAULT_TASK_POLL_INTERVAL_MS = 2000;
+
+function defaultModelIdForTaskType(type) {
+  if (type === "video.generate") return "seedance-2-fast";
+  return "z-image-turbo";
+}
 
 export function resolveTaskRuntimeConfig(db, modelId) {
   const model = db.models?.find((item) => item.id === modelId);
@@ -25,8 +30,8 @@ export async function createAiTask(body) {
     return { error: "projectId, canvasId, nodeId and type are required" };
   }
   const timestamp = now();
-  const modelId = body.modelId || "z-image-turbo";
-  const db = await readJsonQueued();
+  const modelId = body.modelId || defaultModelIdForTaskType(body.type);
+  const db = await getTaskRuntimeDb();
   const runtimeConfig = resolveTaskRuntimeConfig(db, modelId);
   const task = {
     id: id("task"),
@@ -40,7 +45,8 @@ export async function createAiTask(body) {
     progress: 0,
     timeoutMs: runtimeConfig.timeoutMs,
     pollIntervalMs: runtimeConfig.pollIntervalMs,
-    createdBy: "local-user",
+    userId: body.userId || body.createdBy || undefined,
+    createdBy: body.createdBy || body.userId || "local-user",
     createdAt: timestamp,
     updatedAt: timestamp,
   };
@@ -50,13 +56,13 @@ export async function createAiTask(body) {
 }
 
 export async function getAiTask(taskId) {
+  if (await usePostgresBackend()) return getTaskView(taskId);
   const db = await readJsonQueued();
   return db.tasks.find((task) => task.id === taskId);
 }
 
 export async function cancelAiTask(taskId) {
-  const db = await readJsonQueued();
-  const existing = db.tasks.find((item) => item.id === taskId);
+  const existing = await getAiTask(taskId);
   if (!existing) return null;
   if (existing.status === "succeeded" || existing.status === "failed") return existing;
   const task = await updateTask(taskId, {
@@ -68,10 +74,10 @@ export async function cancelAiTask(taskId) {
 }
 
 export async function retryAiTask(taskId) {
-  const db = await readJsonQueued();
-  const existing = db.tasks.find((item) => item.id === taskId);
+  const existing = await getAiTask(taskId);
   if (!existing) return null;
   if (existing.status === "pending" || existing.status === "running") return existing;
+  const db = await getTaskRuntimeDb();
   const runtimeConfig = resolveTaskRuntimeConfig(db, existing.modelId);
   const task = await updateTask(taskId, {
     status: "pending",
@@ -90,13 +96,13 @@ export async function runTask(taskId) {
     const startedAt = now();
     const started = await patchTask(taskId, { status: "running", progress: 10, startedAt }, { onlyStatus: "pending" });
     if (!started) return;
-    const db = await readJsonQueued();
-    const task = db.tasks.find((item) => item.id === taskId);
+    const db = await getTaskRuntimeDb();
+    const task = await getAiTask(taskId);
     if (!task || task.status === "cancelled") return;
 
-    if (task.type !== "image.generate") {
-      await patchTask(taskId, { status: "failed", progress: 0, error: "当前 MVP 只实现图片生成任务" });
-      await recordTaskFailure(task, "当前 MVP 只实现图片生成任务");
+    if (task.type !== "image.generate" && task.type !== "video.generate") {
+      await patchTask(taskId, { status: "failed", progress: 0, error: "当前仅支持图片和视频生成任务" });
+      await recordTaskFailure(task, "当前仅支持图片和视频生成任务");
       return;
     }
 
@@ -117,15 +123,18 @@ export async function runTask(taskId) {
       },
     };
 
-    let imageResult;
+    const mediaType = task.type === "video.generate" ? "video" : "image";
+    let mediaResult;
     try {
       await patchTask(taskId, { progress: 30 });
-      imageResult = await generateImageWithModel(provider, modelForTask, task.input, (progress) =>
-        patchTask(taskId, { progress }, { onlyStatus: "running" }),
-      );
+      mediaResult = mediaType === "video"
+        ? await generateVideoWithModel(provider, modelForTask, task.input, (progress) =>
+          patchTask(taskId, { progress }, { onlyStatus: "running" }))
+        : await generateImageWithModel(provider, modelForTask, task.input, (progress) =>
+          patchTask(taskId, { progress }, { onlyStatus: "running" }));
     } catch (error) {
-      if (model.allowMockFallback !== false) {
-        imageResult = {
+      if (mediaType === "image" && model.allowMockFallback !== false) {
+        mediaResult = {
           providerTaskId: "mock-fallback",
           url: createMockImageResult(task.input),
           raw: { fallback: true, reason: error instanceof Error ? error.message : String(error) },
@@ -139,26 +148,27 @@ export async function runTask(taskId) {
     }
 
     const finishedAt = now();
-    const storedAsset = await storeGeneratedAsset({
+    const storedAsset = await persistGeneratedAsset({
+      userId: task.createdBy || task.userId || "local-user",
       projectId: task.projectId,
       taskId,
-      mediaType: "image",
-      sourceUrl: imageResult.url,
+      mediaType,
+      sourceUrl: mediaResult.url,
     });
-    const imageUrl = storedAsset.url;
+    const resultUrl = storedAsset.url;
     const asset = {
       id: id("asset"),
       projectId: task.projectId,
-      type: "image",
-      url: imageUrl,
-      thumbnailUrl: imageUrl,
+      type: mediaType,
+      url: resultUrl,
+      thumbnailUrl: resultUrl,
       mimeType: storedAsset.mimeType,
       size: storedAsset.size,
       source: "ai-generated",
       storage: storedAsset.storage,
       objectName: storedAsset.objectName,
       bucket: storedAsset.bucket,
-      createdBy: "local-user",
+      createdBy: task.createdBy || task.userId || "local-user",
       createdAt: finishedAt,
     };
 
@@ -166,21 +176,52 @@ export async function runTask(taskId) {
     await updateTask(taskId, {
       status: "succeeded",
       progress: 100,
-      output: { assetId: asset.id, url: imageUrl, providerTaskId: imageResult.providerTaskId, raw: imageResult.raw },
+      output: {
+        assetId: asset.id,
+        url: resultUrl,
+        providerTaskId: mediaResult.providerTaskId,
+        raw: mediaResult.raw,
+        storage: storedAsset.storage,
+        objectName: storedAsset.objectName,
+        bucket: storedAsset.bucket,
+      },
     });
   } finally {
     runningTasks.delete(taskId);
   }
 }
 
+async function persistGeneratedAsset({ userId, projectId, taskId, mediaType, sourceUrl }) {
+  try {
+    return await storeGeneratedAsset({ userId, projectId, taskId, mediaType, sourceUrl });
+  } catch (error) {
+    if (!/Object storage is required/i.test(error instanceof Error ? error.message : String(error))) throw error;
+    return {
+      url: sourceUrl,
+      mimeType: mediaType === "video" ? "video/mp4" : "image/png",
+      size: 0,
+      storage: "remote-url",
+      objectName: undefined,
+      bucket: undefined,
+    };
+  }
+}
+
 async function patchTask(taskId, patch, options = {}) {
   if (options.onlyStatus) {
-    const db = await readJsonQueued();
-    const existing = db.tasks.find((item) => item.id === taskId);
+    const existing = await getAiTask(taskId);
     if (!existing || existing.status !== options.onlyStatus) return false;
   }
   await updateTask(taskId, patch);
   return true;
+}
+
+async function getTaskRuntimeDb() {
+  if (await usePostgresBackend()) {
+    const [models, providers] = await Promise.all([listModelsView(), listProvidersView()]);
+    return { models, providers };
+  }
+  return readJsonQueued();
 }
 
 async function recordTaskFailure(task, error, metadata = {}) {

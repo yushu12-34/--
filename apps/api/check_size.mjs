@@ -1,7 +1,7 @@
 import pg from "pg";
 
 const pool = new pg.Pool({
-  connectionString: "postgresql://anime_canvas_app:yushu123@192.168.100.100:5432/anime_canvas",
+  connectionString: "postgresql://anime_canvas_app:yushu123@192.168.100.100:5433/anime_canvas",
   max: 1,
   connectionTimeoutMillis: 5000,
 });

@@ -3,6 +3,11 @@ import { persistYjsUpdateDirect, saveYjsSnapshotDirect, updateJson } from "../db
 import { id, now } from "../utils/http.js";
 
 const DEFAULT_COMPACT_THRESHOLD = 24;
+// 时间阈值：距上次快照超过此时间（毫秒）才触发异步 compaction，
+// 避免高频编辑时持续 compact 浪费 CPU/IO。
+const DEFAULT_COMPACT_AGE_MS = 60_000;
+// 正在进行 compaction 的 canvasId 集合，防止并发 compaction
+const compactionInFlight = new Set();
 
 export function encodeYUpdate(update) {
   return Buffer.from(update).toString("base64");
@@ -123,15 +128,37 @@ export function getCanvasYjsSnapshotDetail(db, canvasId, snapshotId) {
   };
 }
 
+// 异步 compaction：将当前 doc 状态保存为新快照，并清理已合并的增量更新。
+// fire-and-forget 模式，由 persistYjsUpdate 触发，不阻塞请求。
+async function compactYjsAsync(canvasId, doc) {
+  const encodedSnapshot = encodeYUpdate(Y.encodeStateAsUpdate(doc));
+  await saveYjsSnapshotDirect(canvasId, encodedSnapshot);
+}
+
 export async function persistYjsUpdate(canvasId, update, options = {}) {
   const encodedUpdate = typeof update === "string" ? update : encodeYUpdate(update);
   const compactThreshold = Number(options.compactThreshold || DEFAULT_COMPACT_THRESHOLD);
+  const compactAgeMs = Number(options.compactAgeMs || DEFAULT_COMPACT_AGE_MS);
   const direct = await persistYjsUpdateDirect(canvasId, encodedUpdate, options);
   if (direct.handled) {
     let snapshotRecord = null;
-    if (direct.result?.pendingUpdateCount >= compactThreshold && options.doc instanceof Y.Doc) {
-      const snapshot = await saveYjsSnapshotDirect(canvasId, encodeYUpdate(Y.encodeStateAsUpdate(options.doc)), options);
-      snapshotRecord = snapshot.result;
+    const pendingCount = direct.result?.pendingUpdateCount || 0;
+    const snapshotCreatedAt = direct.result?.snapshotCreatedAt || null;
+    // 异步 compaction：满足以下任一条件时触发
+    // 1. 待合并更新数 >= count 阈值（默认 24）
+    // 2. 距上次快照超过 time 阈值（默认 60s）且有未合并更新
+    const countTriggered = pendingCount >= compactThreshold;
+    const ageTriggered = pendingCount > 0 && snapshotCreatedAt
+      && (Date.now() - new Date(snapshotCreatedAt).getTime()) > compactAgeMs;
+    if ((countTriggered || ageTriggered) && options.doc instanceof Y.Doc && !compactionInFlight.has(canvasId)) {
+      // fire-and-forget：不阻塞当前请求
+      compactionInFlight.add(canvasId);
+      const doc = options.doc;
+      compactYjsAsync(canvasId, doc).catch((error) => {
+        console.error("async yjs compaction failed", error);
+      }).finally(() => {
+        compactionInFlight.delete(canvasId);
+      });
     }
     return { update: direct.result?.update, snapshot: snapshotRecord };
   }
